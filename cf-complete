@@ -3,13 +3,14 @@
 # Cloudflared + Argo 隧道 + 代理内核 全功能管理脚本
 # 功能：
 #   1. 安装/更新 cloudflared
-#   2. 配置 Argo 隧道
+#   2. 配置 Argo 隧道 (支持 Email + Global API Key 认证)
 #   3. Cloudflare DNS 更新（A 记录）
 #   4. 写入 /etc/hosts
 #   5. Argo 隧道 + CNAME 优选路由
 #   6. 安装代理内核（Xray / Sing-box）并自动对接隧道
 #   7. 设置定时自动优选
 #   8. 查看系统状态
+#   9. 生成 V2Ray 客户端连接 (基于优选 IP)
 # 特点：完全交互式，配置持久化，支持非交互模式用于 cron
 # ============================================================
 
@@ -168,20 +169,43 @@ install_cloudflared() {
     cloudflared --version
 }
 
-# ---------- 2. Argo 隧道配置 ----------
+# ---------- 2. Argo 隧道配置 (支持 Email + Global API Key) ----------
 setup_argo_tunnel() {
     echo -e "\n${CYAN}========== 配置 Argo 隧道 ==========${NC}"
     require_cmd cloudflared || return 1
 
+    # ----- 步骤 1: 登录 Cloudflare 认证 -----
     print_info "步骤 1: 登录 Cloudflare 认证"
+    local auth_type=""
     if [[ -f "$HOME/.cloudflared/cert.pem" ]]; then
         print_ok "已检测到认证文件"
         read -rp "是否重新认证? [y/N]: " reauth
-        [[ "$reauth" =~ ^[Yy]$ ]] && cloudflared tunnel login
-    else
-        cloudflared tunnel login
+        [[ ! "$reauth" =~ ^[Yy]$ ]] && auth_type="skip"
     fi
 
+    if [[ "$auth_type" != "skip" ]]; then
+        echo "选择认证方式:"
+        echo "1) 浏览器认证 (默认)"
+        echo "2) Email + Global API Key"
+        read -rp "请选择 [1-2]: " auth_choice
+        case "$auth_choice" in
+            2)
+                read -rp "输入 Cloudflare 注册邮箱: " cf_email
+                read -rsp "输入 Global API Key: " cf_apikey; echo
+                if [[ -z "$cf_email" || -z "$cf_apikey" ]]; then
+                    print_err "邮箱和 API Key 不能为空"; return 1
+                fi
+                print_info "使用 API Key 认证..."
+                cloudflared tunnel login --email "$cf_email" --api-key "$cf_apikey"
+                ;;
+            *)
+                print_info "使用浏览器认证..."
+                cloudflared tunnel login
+                ;;
+        esac
+    fi
+
+    # ----- 步骤 2: 创建/选择隧道 -----
     print_info "步骤 2: 创建/选择隧道"
     echo "1) 创建新隧道"
     echo "2) 列出已有隧道"
@@ -216,6 +240,7 @@ setup_argo_tunnel() {
 
     [[ -z "$tunnel_id" ]] && { print_err "隧道 ID 无效"; return 1; }
 
+    # ----- 步骤 3: 配置隧道路由 -----
     print_info "步骤 3: 配置隧道路由"
     read -rp "输入要代理的本地服务地址 (默认: http://localhost:8080): " local_service
     [[ -z "$local_service" ]] && local_service="http://localhost:8080"
@@ -237,6 +262,7 @@ EOF
     print_info "配置文件已保存: $config_file"
     cat "$config_file"
 
+    # ----- 步骤 4: 配置 DNS 路由 -----
     print_info "步骤 4: 配置 DNS 路由"
     cloudflared tunnel route dns "$tunnel_id" "$tunnel_domain"
     print_ok "DNS 路由已配置: $tunnel_domain -> $tunnel_id"
@@ -249,6 +275,7 @@ LOCAL_SERVICE=${local_service}
 CONFIG_FILE=${config_file}
 EOF
 
+    # ----- 步骤 5: 启动隧道测试 -----
     print_info "步骤 5: 启动隧道测试"
     read -rp "是否立即启动隧道测试? [Y/n]: " start_now
     if [[ ! "$start_now" =~ ^[Nn]$ ]]; then
@@ -624,6 +651,114 @@ show_status() {
     crontab -l 2>/dev/null | grep -i "auto_optimize" || echo "未设置"
 }
 
+# ---------- 9. 生成 V2Ray 客户端连接 ----------
+generate_v2ray_link() {
+    echo -e "\n${CYAN}========== 生成 V2Ray 客户端连接 ==========${NC}"
+
+    # 检查必要配置
+    if [[ ! -f "$CONFIG_DIR/proxy_info.txt" ]]; then
+        print_err "未找到代理内核配置，请先执行选项 6 安装代理内核"
+        return 1
+    fi
+    if [[ ! -f "$CONFIG_DIR/tunnel_info.txt" ]]; then
+        print_err "未找到 Argo 隧道配置，请先执行选项 2 配置隧道"
+        return 1
+    fi
+
+    # 读取配置
+    source "$CONFIG_DIR/proxy_info.txt"
+    # 变量: 协议, 端口, UUID, WebSocket 路径 (格式: 协议: vless/vmess, 端口: ...)
+    local proto=$(echo "$协议" | tr '[:upper:]' '[:lower:]')
+    local port="$端口"
+    local uuid="$UUID"
+    local path="$WebSocket 路径"
+    local domain=""
+
+    # 获取域名（优先使用隧道域名，也可以自定义）
+    source "$CONFIG_DIR/tunnel_info.txt"
+    domain="${TUNNEL_DOMAIN}"
+    echo "当前隧道域名: ${domain}"
+    read -rp "是否使用此域名作为服务器地址? [Y/n]: " use_default_domain
+    if [[ "$use_default_domain" =~ ^[Nn]$ ]]; then
+        read -rp "请输入自定义域名: " domain
+    fi
+    [[ -z "$domain" ]] && { print_err "域名不能为空"; return 1; }
+
+    # 获取优选 IP
+    local best_ip=""
+    read -rp "输入优选 IP (如 1.2.3.4): " best_ip
+    [[ -z "$best_ip" ]] && { print_err "优选 IP 不能为空"; return 1; }
+
+    # 可选：备注名称
+    read -rp "输入备注名称 (可选): " remark
+    [[ -z "$remark" ]] && remark="${domain}-优选"
+
+    echo -e "\n${GREEN}========== 生成的客户端连接信息 ==========${NC}"
+    echo -e "${CYAN}服务器地址: ${best_ip}  (实际连接地址)${NC}"
+    echo -e "${CYAN}域名 (SNI/host): ${domain}${NC}"
+    echo -e "${CYAN}端口: ${port}${NC}"
+    echo -e "${CYAN}UUID: ${uuid}${NC}"
+    echo -e "${CYAN}传输协议: ws${NC}"
+    echo -e "${CYAN}路径: ${path}${NC}"
+    echo -e "${CYAN}安全: tls${NC}"
+    echo ""
+
+    if [[ "$proto" == "vmess" ]]; then
+        # 生成 vmess:// 链接 (base64编码的JSON)
+        local vmess_json=$(cat <<EOF
+{
+  "v": "2",
+  "ps": "${remark}",
+  "add": "${best_ip}",
+  "port": "${port}",
+  "id": "${uuid}",
+  "aid": "0",
+  "net": "ws",
+  "type": "none",
+  "host": "${domain}",
+  "path": "${path}",
+  "tls": "tls"
+}
+EOF
+)
+        local vmess_base64=$(echo -n "$vmess_json" | base64 -w 0)
+        echo -e "${GREEN}VMess 链接:${NC}"
+        echo "vmess://${vmess_base64}"
+        echo ""
+        echo -e "${YELLOW}提示：导入客户端时，请手动修改地址为 ${best_ip}，并设置 SNI 为 ${domain}${NC}"
+    elif [[ "$proto" == "vless" ]]; then
+        # 生成 vless:// 链接
+        local vless_url="vless://${uuid}@${best_ip}:${port}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encode_path}${path}#${remark}"
+        # 注意: path 需要 URL 编码
+        local encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${path}'))" 2>/dev/null || echo "${path}")
+        vless_url="vless://${uuid}@${best_ip}:${port}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encoded_path}#${remark}"
+        echo -e "${GREEN}VLESS 链接:${NC}"
+        echo "${vless_url}"
+        echo ""
+    else
+        print_err "不支持的协议: $proto"
+        return 1
+    fi
+
+    # 输出通用客户端配置提示
+    echo -e "${YELLOW}======================================${NC}"
+    echo -e "客户端配置提示 (通用):"
+    echo -e "地址(address): ${best_ip}"
+    echo -e "端口(port): ${port}"
+    echo -e "用户ID(id): ${uuid}"
+    echo -e "传输协议(network): ws"
+    echo -e "WebSocket路径(path): ${path}"
+    echo -e "TLS: 开启"
+    echo -e "SNI/host: ${domain}"
+    echo -e "======================================"
+
+    # 可选：自动写入 hosts 或更新 DNS？
+    read -rp "是否将 ${domain} 在本地 hosts 中指向 ${best_ip}? [y/N]: " write_hosts
+    if [[ "$write_hosts" =~ ^[Yy]$ ]]; then
+        write_hosts_file "$best_ip" "$domain"
+    fi
+}
+
 # ---------- 主菜单 ----------
 show_menu() {
     echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -637,6 +772,7 @@ show_menu() {
     echo -e "  ${GREEN}6${NC}. 安装代理内核 (Xray/Sing-box) 并自动对接隧道"
     echo -e "  ${GREEN}7${NC}. 设置定时自动 DNS 更新"
     echo -e "  ${GREEN}8${NC}. 查看系统状态"
+    echo -e "  ${GREEN}9${NC}. 生成 V2Ray 客户端连接 (基于优选 IP)"
     echo -e "  ${GREEN}0${NC}. 退出"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
@@ -647,7 +783,7 @@ main() {
     print_banner
     while true; do
         show_menu
-        read -rp "请选择 [0-8]: " choice
+        read -rp "请选择 [0-9]: " choice
         case "$choice" in
             1) install_cloudflared ;;
             2) setup_argo_tunnel ;;
@@ -657,6 +793,7 @@ main() {
             6) install_proxy_core ;;
             7) setup_cron ;;
             8) show_status ;;
+            9) generate_v2ray_link ;;
             0) print_ok "再见!"; exit 0 ;;
             *) print_err "无效选择" ;;
         esac
