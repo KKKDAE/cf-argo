@@ -1,0 +1,869 @@
+#!/bin/bash
+# ============================================================
+# Cloudflared + Argo 隧道 + 优选 IP + 代理内核 全功能管理脚本
+# 功能：
+#   1. 安装/更新 cloudflared
+#   2. 配置 Argo 隧道
+#   3. 优选 IP 测速（内置 IP 池 + 并发测速）
+#   4. Cloudflare DNS 更新（A 记录）
+#   5. 写入 /etc/hosts
+#   6. Argo 隧道 + CNAME 优选路由
+#   7. 安装代理内核（Xray / Sing-box）并自动对接隧道
+#   8. 设置定时自动优选
+#   9. 查看系统状态
+# 特点：完全交互式，配置持久化，支持非交互模式用于 cron
+# ============================================================
+
+set -e
+
+# ---------- 颜色定义 ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ---------- 配置变量 ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="$SCRIPT_DIR/.cloudflare-config"
+LOG_DIR="$CONFIG_DIR/logs"
+RESULT_FILE="$CONFIG_DIR/best_ip.txt"
+CF_API_URL="https://api.cloudflare.com/client/v4"
+
+# ---------- 完整的 Cloudflare 优选 IP 列表 ----------
+declare -a CF_IP_LIST=(
+    "104.16.0.0" "104.16.1.0" "104.16.2.0" "104.16.3.0" "104.16.4.0" "104.16.5.0" "104.16.6.0" "104.16.7.0"
+    "104.16.8.0" "104.16.9.0" "104.16.10.0" "104.16.11.0" "104.16.12.0" "104.16.13.0" "104.16.14.0" "104.16.15.0"
+    "104.16.16.0" "104.16.17.0" "104.16.18.0" "104.16.19.0" "104.16.20.0" "104.16.21.0" "104.16.22.0" "104.16.23.0"
+    "104.16.24.0" "104.16.25.0" "104.16.26.0" "104.16.27.0" "104.16.28.0" "104.16.29.0" "104.16.30.0" "104.16.31.0"
+    "104.16.32.0" "104.16.33.0" "104.16.34.0" "104.16.35.0" "104.16.36.0" "104.16.37.0" "104.16.38.0" "104.16.39.0"
+    "104.16.40.0" "104.16.41.0" "104.16.42.0" "104.16.43.0" "104.16.44.0" "104.16.45.0" "104.16.46.0" "104.16.47.0"
+    "104.16.48.0" "104.16.49.0" "104.16.50.0" "104.16.51.0" "104.16.52.0" "104.16.53.0" "104.16.54.0" "104.16.55.0"
+    "104.16.56.0" "104.16.57.0" "104.16.58.0" "104.16.59.0" "104.16.60.0" "104.16.61.0" "104.16.62.0" "104.16.63.0"
+    "104.16.64.0" "104.16.65.0" "104.16.66.0" "104.16.67.0" "104.16.68.0" "104.16.69.0" "104.16.70.0" "104.16.71.0"
+    "104.16.72.0" "104.16.73.0" "104.16.74.0" "104.16.75.0" "104.16.76.0" "104.16.77.0" "104.16.78.0" "104.16.79.0"
+    "104.16.80.0" "104.16.81.0" "104.16.82.0" "104.16.83.0" "104.16.84.0" "104.16.85.0" "104.16.86.0" "104.16.87.0"
+    "104.16.88.0" "104.16.89.0" "104.16.90.0" "104.16.91.0" "104.16.92.0" "104.16.93.0" "104.16.94.0" "104.16.95.0"
+    "104.16.96.0" "104.16.97.0" "104.16.98.0" "104.16.99.0" "104.16.100.0" "104.16.101.0" "104.16.102.0" "104.16.103.0"
+    "104.16.104.0" "104.16.105.0" "104.16.106.0" "104.16.107.0" "104.16.108.0" "104.16.109.0" "104.16.110.0" "104.16.111.0"
+    "104.16.112.0" "104.16.113.0" "104.16.114.0" "104.16.115.0" "104.16.116.0" "104.16.117.0" "104.16.118.0" "104.16.119.0"
+    "104.16.120.0" "104.16.121.0" "104.16.122.0" "104.16.123.0" "104.16.124.0" "104.16.125.0" "104.16.126.0" "104.16.127.0"
+    "104.16.128.0" "104.16.129.0" "104.16.130.0" "104.16.131.0" "104.16.132.0" "104.16.133.0" "104.16.134.0" "104.16.135.0"
+    "104.16.136.0" "104.16.137.0" "104.16.138.0" "104.16.139.0" "104.16.140.0" "104.16.141.0" "104.16.142.0" "104.16.143.0"
+    "104.16.144.0" "104.16.145.0" "104.16.146.0" "104.16.147.0" "104.16.148.0" "104.16.149.0" "104.16.150.0" "104.16.151.0"
+    "104.16.152.0" "104.16.153.0" "104.16.154.0" "104.16.155.0" "104.16.156.0" "104.16.157.0" "104.16.158.0" "104.16.159.0"
+    "104.16.160.0" "104.16.161.0" "104.16.162.0" "104.16.163.0" "104.16.164.0" "104.16.165.0" "104.16.166.0" "104.16.167.0"
+    "104.16.168.0" "104.16.169.0" "104.16.170.0" "104.16.171.0" "104.16.172.0" "104.16.173.0" "104.16.174.0" "104.16.175.0"
+    "104.16.176.0" "104.16.177.0" "104.16.178.0" "104.16.179.0" "104.16.180.0" "104.16.181.0" "104.16.182.0" "104.16.183.0"
+    "104.16.184.0" "104.16.185.0" "104.16.186.0" "104.16.187.0" "104.16.188.0" "104.16.189.0" "104.16.190.0" "104.16.191.0"
+    "104.16.192.0" "104.16.193.0" "104.16.194.0" "104.16.195.0" "104.16.196.0" "104.16.197.0" "104.16.198.0" "104.16.199.0"
+    "104.16.200.0" "104.16.201.0" "104.16.202.0" "104.16.203.0" "104.16.204.0" "104.16.205.0" "104.16.206.0" "104.16.207.0"
+    "104.16.208.0" "104.16.209.0" "104.16.210.0" "104.16.211.0" "104.16.212.0" "104.16.213.0" "104.16.214.0" "104.16.215.0"
+    "104.16.216.0" "104.16.217.0" "104.16.218.0" "104.16.219.0" "104.16.220.0" "104.16.221.0" "104.16.222.0" "104.16.223.0"
+    "104.16.224.0" "104.16.225.0" "104.16.226.0" "104.16.227.0" "104.16.228.0" "104.16.229.0" "104.16.230.0" "104.16.231.0"
+    "104.16.232.0" "104.16.233.0" "104.16.234.0" "104.16.235.0" "104.16.236.0" "104.16.237.0" "104.16.238.0" "104.16.239.0"
+    "104.16.240.0" "104.16.241.0" "104.16.242.0" "104.16.243.0" "104.16.244.0" "104.16.245.0" "104.16.246.0" "104.16.247.0"
+    "104.16.248.0" "104.16.249.0" "104.16.250.0" "104.16.251.0" "104.16.252.0" "104.16.253.0" "104.16.254.0" "104.16.255.0"
+    "104.17.0.0" "104.17.1.0" "104.17.2.0" "104.17.3.0" "104.17.4.0" "104.17.5.0" "104.17.6.0" "104.17.7.0"
+    "104.17.8.0" "104.17.9.0" "104.17.10.0" "104.17.11.0" "104.17.12.0" "104.17.13.0" "104.17.14.0" "104.17.15.0"
+    "104.17.16.0" "104.17.17.0" "104.17.18.0" "104.17.19.0" "104.17.20.0" "104.17.21.0" "104.17.22.0" "104.17.23.0"
+    "104.17.24.0" "104.17.25.0" "104.17.26.0" "104.17.27.0" "104.17.28.0" "104.17.29.0" "104.17.30.0" "104.17.31.0"
+    "104.17.32.0" "104.17.33.0" "104.17.34.0" "104.17.35.0" "104.17.36.0" "104.17.37.0" "104.17.38.0" "104.17.39.0"
+    "104.17.40.0" "104.17.41.0" "104.17.42.0" "104.17.43.0" "104.17.44.0" "104.17.45.0" "104.17.46.0" "104.17.47.0"
+    "104.17.48.0" "104.17.49.0" "104.17.50.0" "104.17.51.0" "104.17.52.0" "104.17.53.0" "104.17.54.0" "104.17.55.0"
+    "104.17.56.0" "104.17.57.0" "104.17.58.0" "104.17.59.0" "104.17.60.0" "104.17.61.0" "104.17.62.0" "104.17.63.0"
+    "104.17.64.0" "104.17.65.0" "104.17.66.0" "104.17.67.0" "104.17.68.0" "104.17.69.0" "104.17.70.0" "104.17.71.0"
+    "104.17.72.0" "104.17.73.0" "104.17.74.0" "104.17.75.0" "104.17.76.0" "104.17.77.0" "104.17.78.0" "104.17.79.0"
+    "104.17.80.0" "104.17.81.0" "104.17.82.0" "104.17.83.0" "104.17.84.0" "104.17.85.0" "104.17.86.0" "104.17.87.0"
+    "104.17.88.0" "104.17.89.0" "104.17.90.0" "104.17.91.0" "104.17.92.0" "104.17.93.0" "104.17.94.0" "104.17.95.0"
+    "104.17.96.0" "104.17.97.0" "104.17.98.0" "104.17.99.0" "104.17.100.0" "104.17.101.0" "104.17.102.0" "104.17.103.0"
+    "104.17.104.0" "104.17.105.0" "104.17.106.0" "104.17.107.0" "104.17.108.0" "104.17.109.0" "104.17.110.0" "104.17.111.0"
+    "104.17.112.0" "104.17.113.0" "104.17.114.0" "104.17.115.0" "104.17.116.0" "104.17.117.0" "104.17.118.0" "104.17.119.0"
+    "104.17.120.0" "104.17.121.0" "104.17.122.0" "104.17.123.0" "104.17.124.0" "104.17.125.0" "104.17.126.0" "104.17.127.0"
+    "104.17.128.0" "104.17.129.0" "104.17.130.0" "104.17.131.0" "104.17.132.0" "104.17.133.0" "104.17.134.0" "104.17.135.0"
+    "104.17.136.0" "104.17.137.0" "104.17.138.0" "104.17.139.0" "104.17.140.0" "104.17.141.0" "104.17.142.0" "104.17.143.0"
+    "104.17.144.0" "104.17.145.0" "104.17.146.0" "104.17.147.0" "104.17.148.0" "104.17.149.0" "104.17.150.0" "104.17.151.0"
+    "104.17.152.0" "104.17.153.0" "104.17.154.0" "104.17.155.0" "104.17.156.0" "104.17.157.0" "104.17.158.0" "104.17.159.0"
+    "104.17.160.0" "104.17.161.0" "104.17.162.0" "104.17.163.0" "104.17.164.0" "104.17.165.0" "104.17.166.0" "104.17.167.0"
+    "104.17.168.0" "104.17.169.0" "104.17.170.0" "104.17.171.0" "104.17.172.0" "104.17.173.0" "104.17.174.0" "104.17.175.0"
+    "104.17.176.0" "104.17.177.0" "104.17.178.0" "104.17.179.0" "104.17.180.0" "104.17.181.0" "104.17.182.0" "104.17.183.0"
+    "104.17.184.0" "104.17.185.0" "104.17.186.0" "104.17.187.0" "104.17.188.0" "104.17.189.0" "104.17.190.0" "104.17.191.0"
+    "104.17.192.0" "104.17.193.0" "104.17.194.0" "104.17.195.0" "104.17.196.0" "104.17.197.0" "104.17.198.0" "104.17.199.0"
+    "104.17.200.0" "104.17.201.0" "104.17.202.0" "104.17.203.0" "104.17.204.0" "104.17.205.0" "104.17.206.0" "104.17.207.0"
+    "104.17.208.0" "104.17.209.0" "104.17.210.0" "104.17.211.0" "104.17.212.0" "104.17.213.0" "104.17.214.0" "104.17.215.0"
+    "104.17.216.0" "104.17.217.0" "104.17.218.0" "104.17.219.0" "104.17.220.0" "104.17.221.0" "104.17.222.0" "104.17.223.0"
+    "104.17.224.0" "104.17.225.0" "104.17.226.0" "104.17.227.0" "104.17.228.0" "104.17.229.0" "104.17.230.0" "104.17.231.0"
+    "104.17.232.0" "104.17.233.0" "104.17.234.0" "104.17.235.0" "104.17.236.0" "104.17.237.0" "104.17.238.0" "104.17.239.0"
+    "104.17.240.0" "104.17.241.0" "104.17.242.0" "104.17.243.0" "104.17.244.0" "104.17.245.0" "104.17.246.0" "104.17.247.0"
+    "104.17.248.0" "104.17.249.0" "104.17.250.0" "104.17.251.0" "104.17.252.0" "104.17.253.0" "104.17.254.0" "104.17.255.0"
+    "104.18.0.0" "104.18.1.0" "104.18.2.0" "104.18.3.0" "104.18.4.0" "104.18.5.0" "104.18.6.0" "104.18.7.0"
+    "104.18.8.0" "104.18.9.0" "104.18.10.0" "104.18.11.0" "104.18.12.0" "104.18.13.0" "104.18.14.0" "104.18.15.0"
+    "104.18.16.0" "104.18.17.0" "104.18.18.0" "104.18.19.0" "104.18.20.0" "104.18.21.0" "104.18.22.0" "104.18.23.0"
+    "104.18.24.0" "104.18.25.0" "104.18.26.0" "104.18.27.0" "104.18.28.0" "104.18.29.0" "104.18.30.0" "104.18.31.0"
+    "104.18.32.0" "104.18.33.0" "104.18.34.0" "104.18.35.0" "104.18.36.0" "104.18.37.0" "104.18.38.0" "104.18.39.0"
+    "104.18.40.0" "104.18.41.0" "104.18.42.0" "104.18.43.0" "104.18.44.0" "104.18.45.0" "104.18.46.0" "104.18.47.0"
+    "104.18.48.0" "104.18.49.0" "104.18.50.0" "104.18.51.0" "104.18.52.0" "104.18.53.0" "104.18.54.0" "104.18.55.0"
+    "104.18.56.0" "104.18.57.0" "104.18.58.0" "104.18.59.0" "104.18.60.0" "104.18.61.0" "104.18.62.0" "104.18.63.0"
+    "104.18.64.0" "104.18.65.0" "104.18.66.0" "104.18.67.0" "104.18.68.0" "104.18.69.0" "104.18.70.0" "104.18.71.0"
+    "104.18.72.0" "104.18.73.0" "104.18.74.0" "104.18.75.0" "104.18.76.0" "104.18.77.0" "104.18.78.0" "104.18.79.0"
+    "104.18.80.0" "104.18.81.0" "104.18.82.0" "104.18.83.0" "104.18.84.0" "104.18.85.0" "104.18.86.0" "104.18.87.0"
+    "104.18.88.0" "104.18.89.0" "104.18.90.0" "104.18.91.0" "104.18.92.0" "104.18.93.0" "104.18.94.0" "104.18.95.0"
+    "104.18.96.0" "104.18.97.0" "104.18.98.0" "104.18.99.0" "104.18.100.0" "104.18.101.0" "104.18.102.0" "104.18.103.0"
+    "104.18.104.0" "104.18.105.0" "104.18.106.0" "104.18.107.0" "104.18.108.0" "104.18.109.0" "104.18.110.0" "104.18.111.0"
+    "104.18.112.0" "104.18.113.0" "104.18.114.0" "104.18.115.0" "104.18.116.0" "104.18.117.0" "104.18.118.0" "104.18.119.0"
+    "104.18.120.0" "104.18.121.0" "104.18.122.0" "104.18.123.0" "104.18.124.0" "104.18.125.0" "104.18.126.0" "104.18.127.0"
+    "104.18.128.0" "104.18.129.0" "104.18.130.0" "104.18.131.0" "104.18.132.0" "104.18.133.0" "104.18.134.0" "104.18.135.0"
+    "104.18.136.0" "104.18.137.0" "104.18.138.0" "104.18.139.0" "104.18.140.0" "104.18.141.0" "104.18.142.0" "104.18.143.0"
+    "104.18.144.0" "104.18.145.0" "104.18.146.0" "104.18.147.0" "104.18.148.0" "104.18.149.0" "104.18.150.0" "104.18.151.0"
+    "104.18.152.0" "104.18.153.0" "104.18.154.0" "104.18.155.0" "104.18.156.0" "104.18.157.0" "104.18.158.0" "104.18.159.0"
+    "104.18.160.0" "104.18.161.0" "104.18.162.0" "104.18.163.0" "104.18.164.0" "104.18.165.0" "104.18.166.0" "104.18.167.0"
+    "104.18.168.0" "104.18.169.0" "104.18.170.0" "104.18.171.0" "104.18.172.0" "104.18.173.0" "104.18.174.0" "104.18.175.0"
+    "104.18.176.0" "104.18.177.0" "104.18.178.0" "104.18.179.0" "104.18.180.0" "104.18.181.0" "104.18.182.0" "104.18.183.0"
+    "104.18.184.0" "104.18.185.0" "104.18.186.0" "104.18.187.0" "104.18.188.0" "104.18.189.0" "104.18.190.0" "104.18.191.0"
+    "104.18.192.0" "104.18.193.0" "104.18.194.0" "104.18.195.0" "104.18.196.0" "104.18.197.0" "104.18.198.0" "104.18.199.0"
+    "104.18.200.0" "104.18.201.0" "104.18.202.0" "104.18.203.0" "104.18.204.0" "104.18.205.0" "104.18.206.0" "104.18.207.0"
+    "104.18.208.0" "104.18.209.0" "104.18.210.0" "104.18.211.0" "104.18.212.0" "104.18.213.0" "104.18.214.0" "104.18.215.0"
+    "104.18.216.0" "104.18.217.0" "104.18.218.0" "104.18.219.0" "104.18.220.0" "104.18.221.0" "104.18.222.0" "104.18.223.0"
+    "104.18.224.0" "104.18.225.0" "104.18.226.0" "104.18.227.0" "104.18.228.0" "104.18.229.0" "104.18.230.0" "104.18.231.0"
+    "104.18.232.0" "104.18.233.0" "104.18.234.0" "104.18.235.0" "104.18.236.0" "104.18.237.0" "104.18.238.0" "104.18.239.0"
+    "104.18.240.0" "104.18.241.0" "104.18.242.0" "104.18.243.0" "104.18.244.0" "104.18.245.0" "104.18.246.0" "104.18.247.0"
+    "104.18.248.0" "104.18.249.0" "104.18.250.0" "104.18.251.0" "104.18.252.0" "104.18.253.0" "104.18.254.0" "104.18.255.0"
+    "104.19.0.0" "104.19.1.0" "104.19.2.0" "104.19.3.0" "104.19.4.0" "104.19.5.0" "104.19.6.0" "104.19.7.0"
+    "104.19.8.0" "104.19.9.0" "104.19.10.0" "104.19.11.0" "104.19.12.0" "104.19.13.0" "104.19.14.0" "104.19.15.0"
+    "104.19.16.0" "104.19.17.0" "104.19.18.0" "104.19.19.0" "104.19.20.0" "104.19.21.0" "104.19.22.0" "104.19.23.0"
+    "104.19.24.0" "104.19.25.0" "104.19.26.0" "104.19.27.0" "104.19.28.0" "104.19.29.0" "104.19.30.0" "104.19.31.0"
+    "104.19.32.0" "104.19.33.0" "104.19.34.0" "104.19.35.0" "104.19.36.0" "104.19.37.0" "104.19.38.0" "104.19.39.0"
+    "104.19.40.0" "104.19.41.0" "104.19.42.0" "104.19.43.0" "104.19.44.0" "104.19.45.0" "104.19.46.0" "104.19.47.0"
+    "104.19.48.0" "104.19.49.0" "104.19.50.0" "104.19.51.0" "104.19.52.0" "104.19.53.0" "104.19.54.0" "104.19.55.0"
+    "104.19.56.0" "104.19.57.0" "104.19.58.0" "104.19.59.0" "104.19.60.0" "104.19.61.0" "104.19.62.0" "104.19.63.0"
+    "104.19.64.0" "104.19.65.0" "104.19.66.0" "104.19.67.0" "104.19.68.0" "104.19.69.0" "104.19.70.0" "104.19.71.0"
+    "104.19.72.0" "104.19.73.0" "104.19.74.0" "104.19.75.0" "104.19.76.0" "104.19.77.0" "104.19.78.0" "104.19.79.0"
+    "104.19.80.0" "104.19.81.0" "104.19.82.0" "104.19.83.0" "104.19.84.0" "104.19.85.0" "104.19.86.0" "104.19.87.0"
+    "104.19.88.0" "104.19.89.0" "104.19.90.0" "104.19.91.0" "104.19.92.0" "104.19.93.0" "104.19.94.0" "104.19.95.0"
+    "104.19.96.0" "104.19.97.0" "104.19.98.0" "104.19.99.0" "104.19.100.0" "104.19.101.0" "104.19.102.0" "104.19.103.0"
+    "104.19.104.0" "104.19.105.0" "104.19.106.0" "104.19.107.0" "104.19.108.0" "104.19.109.0" "104.19.110.0" "104.19.111.0"
+    "104.19.112.0" "104.19.113.0" "104.19.114.0" "104.19.115.0" "104.19.116.0" "104.19.117.0" "104.19.118.0" "104.19.119.0"
+    "104.19.120.0" "104.19.121.0" "104.19.122.0" "104.19.123.0" "104.19.124.0" "104.19.125.0" "104.19.126.0" "104.19.127.0"
+    "104.19.128.0" "104.19.129.0" "104.19.130.0" "104.19.131.0" "104.19.132.0" "104.19.133.0" "104.19.134.0" "104.19.135.0"
+    "104.19.136.0" "104.19.137.0" "104.19.138.0" "104.19.139.0" "104.19.140.0" "104.19.141.0" "104.19.142.0" "104.19.143.0"
+    "104.19.144.0" "104.19.145.0" "104.19.146.0" "104.19.147.0" "104.19.148.0" "104.19.149.0" "104.19.150.0" "104.19.151.0"
+    "104.19.152.0" "104.19.153.0" "104.19.154.0" "104.19.155.0" "104.19.156.0" "104.19.157.0" "104.19.158.0" "104.19.159.0"
+    "104.19.160.0" "104.19.161.0" "104.19.162.0" "104.19.163.0" "104.19.164.0" "104.19.165.0" "104.19.166.0" "104.19.167.0"
+    "104.19.168.0" "104.19.169.0" "104.19.170.0" "104.19.171.0" "104.19.172.0" "104.19.173.0" "104.19.174.0" "104.19.175.0"
+    "104.19.176.0" "104.19.177.0" "104.19.178.0" "104.19.179.0" "104.19.180.0" "104.19.181.0" "104.19.182.0" "104.19.183.0"
+    "104.19.184.0" "104.19.185.0" "104.19.186.0" "104.19.187.0" "104.19.188.0" "104.19.189.0" "104.19.190.0" "104.19.191.0"
+    "104.19.192.0" "104.19.193.0" "104.19.194.0" "104.19.195.0" "104.19.196.0" "104.19.197.0" "104.19.198.0" "104.19.199.0"
+    "104.19.200.0" "104.19.201.0" "104.19.202.0" "104.19.203.0" "104.19.204.0" "104.19.205.0" "104.19.206.0" "104.19.207.0"
+    "104.19.208.0" "104.19.209.0" "104.19.210.0" "104.19.211.0" "104.19.212.0" "104.19.213.0" "104.19.214.0" "104.19.215.0"
+    "104.19.216.0" "104.19.217.0" "104.19.218.0" "104.19.219.0" "104.19.220.0" "104.19.221.0" "104.19.222.0" "104.19.223.0"
+    "104.19.224.0" "104.19.225.0" "104.19.226.0" "104.19.227.0" "104.19.228.0" "104.19.229.0" "104.19.230.0" "104.19.231.0"
+    "104.19.232.0" "104.19.233.0" "104.19.234.0" "104.19.235.0" "104.19.236.0" "104.19.237.0" "104.19.238.0" "104.19.239.0"
+    "104.19.240.0" "104.19.241.0" "104.19.242.0" "104.19.243.0" "104.19.244.0" "104.19.245.0" "104.19.246.0" "104.19.247.0"
+    "104.19.248.0" "104.19.249.0" "104.19.250.0" "104.19.251.0" "104.19.252.0" "104.19.253.0" "104.19.254.0" "104.19.255.0"
+    "172.64.0.0" "172.64.1.0" "172.64.2.0" "172.64.3.0" "172.64.4.0" "172.64.5.0" "172.64.6.0" "172.64.7.0"
+    "172.64.8.0" "172.64.9.0" "172.64.10.0" "172.64.11.0" "172.64.12.0" "172.64.13.0" "172.64.14.0" "172.64.15.0"
+    "172.64.32.0" "172.64.33.0" "172.64.34.0" "172.64.35.0" "172.64.36.0" "172.64.37.0" "172.64.38.0" "172.64.39.0"
+    "172.65.0.0" "172.65.1.0" "172.65.2.0" "172.65.3.0" "172.65.4.0" "172.65.5.0" "172.65.6.0" "172.65.7.0"
+    "172.65.32.0" "172.65.33.0" "172.65.34.0" "172.65.35.0" "172.65.36.0" "172.65.37.0" "172.65.38.0" "172.65.39.0"
+    "172.66.0.0" "172.66.1.0" "172.66.2.0" "172.66.3.0" "172.66.32.0" "172.66.33.0" "172.66.34.0" "172.66.35.0"
+    "172.67.0.0" "172.67.1.0" "172.67.2.0" "172.67.3.0" "172.67.32.0" "172.67.33.0" "172.67.34.0" "172.67.35.0"
+    "172.68.0.0" "172.68.1.0" "172.68.2.0" "172.68.3.0" "172.68.32.0" "172.68.33.0" "172.68.34.0" "172.68.35.0"
+    "172.69.0.0" "172.69.1.0" "172.69.2.0" "172.69.3.0" "172.69.32.0" "172.69.33.0" "172.69.34.0" "172.69.35.0"
+    "198.41.200.0" "198.41.201.0" "198.41.202.0" "198.41.203.0" "198.41.204.0" "198.41.205.0" "198.41.206.0" "198.41.207.0"
+    "198.41.208.0" "198.41.209.0" "198.41.210.0" "198.41.211.0" "198.41.212.0" "198.41.213.0" "198.41.214.0" "198.41.215.0"
+    "198.41.216.0" "198.41.217.0" "198.41.218.0" "198.41.219.0" "198.41.220.0" "198.41.221.0" "198.41.222.0" "198.41.223.0"
+    "198.41.224.0" "198.41.225.0" "198.41.226.0" "198.41.227.0" "198.41.228.0" "198.41.229.0" "198.41.230.0" "198.41.231.0"
+    "198.41.232.0" "198.41.233.0" "198.41.234.0" "198.41.235.0" "198.41.236.0" "198.41.237.0" "198.41.238.0" "198.41.239.0"
+    "198.41.240.0" "198.41.241.0" "198.41.242.0" "198.41.243.0" "198.41.244.0" "198.41.245.0" "198.41.246.0" "198.41.247.0"
+    "198.41.248.0" "198.41.249.0" "198.41.250.0" "198.41.251.0" "198.41.252.0" "198.41.253.0" "198.41.254.0" "198.41.255.0"
+)
+
+# ---------- 工具函数 ----------
+print_banner() {
+    echo -e "${CYAN}"
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║   Cloudflared + Argo 隧道 + 优选 IP + 代理内核 管理工具        ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
+print_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+print_err()  { echo -e "${RED}[ERR]${NC} $1"; }
+
+require_cmd() {
+    if ! command -v "$1" &>/dev/null; then
+        print_err "缺少命令: $1，请先安装"
+        return 1
+    fi
+    return 0
+}
+
+ensure_dirs() {
+    mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+}
+
+# ---------- 1. 安装 cloudflared ----------
+install_cloudflared() {
+    echo -e "\n${CYAN}========== 安装 cloudflared ==========${NC}"
+    if command -v cloudflared &>/dev/null; then
+        local ver=$(cloudflared --version 2>/dev/null | head -1)
+        print_ok "cloudflared 已安装: $ver"
+        read -rp "是否重新安装/更新? [y/N]: " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+    fi
+
+    local arch=$(uname -m)
+    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local download_url=""
+
+    case "$arch" in
+        x86_64|amd64)  arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l|armv7)  arch="arm" ;;
+        i386|i686)     arch="386" ;;
+        *) print_err "不支持的架构: $arch"; return 1 ;;
+    esac
+
+    case "$os" in
+        linux)   download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" ;;
+        darwin)  download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${arch}" ;;
+        *) print_err "不支持的操作系统: $os"; return 1 ;;
+    esac
+
+    print_info "正在下载: $download_url"
+    local tmpfile=$(mktemp)
+    if command -v curl &>/dev/null; then
+        curl -fsSL -o "$tmpfile" "$download_url" || { print_err "下载失败"; rm -f "$tmpfile"; return 1; }
+    elif command -v wget &>/dev/null; then
+        wget -q -O "$tmpfile" "$download_url" || { print_err "下载失败"; rm -f "$tmpfile"; return 1; }
+    else
+        print_err "需要 curl 或 wget"
+        return 1
+    fi
+
+    chmod +x "$tmpfile"
+    if [[ "$os" == "linux" ]]; then
+        sudo mv "$tmpfile" /usr/local/bin/cloudflared 2>/dev/null || {
+            print_warn "无法写入 /usr/local/bin，尝试写入 ~/.local/bin"
+            mkdir -p ~/.local/bin
+            mv "$tmpfile" ~/.local/bin/cloudflared
+            export PATH="$HOME/.local/bin:$PATH"
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+        }
+    else
+        sudo mv "$tmpfile" /usr/local/bin/cloudflared 2>/dev/null || mv "$tmpfile" /usr/local/bin/cloudflared
+    fi
+
+    print_ok "cloudflared 安装完成"
+    cloudflared --version
+}
+
+# ---------- 2. Argo 隧道配置 ----------
+setup_argo_tunnel() {
+    echo -e "\n${CYAN}========== 配置 Argo 隧道 ==========${NC}"
+    require_cmd cloudflared || return 1
+
+    print_info "步骤 1: 登录 Cloudflare 认证"
+    if [[ -f "$HOME/.cloudflared/cert.pem" ]]; then
+        print_ok "已检测到认证文件"
+        read -rp "是否重新认证? [y/N]: " reauth
+        [[ "$reauth" =~ ^[Yy]$ ]] && cloudflared tunnel login
+    else
+        cloudflared tunnel login
+    fi
+
+    print_info "步骤 2: 创建/选择隧道"
+    echo "1) 创建新隧道"
+    echo "2) 列出已有隧道"
+    echo "3) 使用已有隧道"
+    read -rp "请选择 [1-3]: " tunnel_choice
+
+    local tunnel_id=""
+    local tunnel_name=""
+
+    case "$tunnel_choice" in
+        1)
+            read -rp "输入隧道名称 (如: my-tunnel): " tunnel_name
+            [[ -z "$tunnel_name" ]] && { print_err "名称不能为空"; return 1; }
+            print_info "正在创建隧道: $tunnel_name"
+            cloudflared tunnel create "$tunnel_name"
+            tunnel_id=$(cloudflared tunnel list | grep "$tunnel_name" | awk '{print $1}')
+            print_ok "隧道创建成功，ID: $tunnel_id"
+            ;;
+        2)
+            print_info "已有隧道列表:"
+            cloudflared tunnel list
+            read -rp "输入要使用的隧道 ID: " tunnel_id
+            ;;
+        3)
+            read -rp "输入隧道 ID: " tunnel_id
+            ;;
+        *)
+            print_err "无效选择"
+            return 1
+            ;;
+    esac
+
+    [[ -z "$tunnel_id" ]] && { print_err "隧道 ID 无效"; return 1; }
+
+    print_info "步骤 3: 配置隧道路由"
+    read -rp "输入要代理的本地服务地址 (默认: http://localhost:8080): " local_service
+    [[ -z "$local_service" ]] && local_service="http://localhost:8080"
+    
+    read -rp "输入要绑定的域名 (如: tunnel.example.com): " tunnel_domain
+    [[ -z "$tunnel_domain" ]] && { print_err "域名不能为空"; return 1; }
+
+    local config_file="$CONFIG_DIR/${tunnel_id}.yml"
+    cat > "$config_file" <<EOF
+tunnel: ${tunnel_id}
+credentials-file: ${HOME}/.cloudflared/${tunnel_id}.json
+
+ingress:
+  - hostname: ${tunnel_domain}
+    service: ${local_service}
+  - service: http_status:404
+EOF
+
+    print_info "配置文件已保存: $config_file"
+    cat "$config_file"
+
+    print_info "步骤 4: 配置 DNS 路由"
+    cloudflared tunnel route dns "$tunnel_id" "$tunnel_domain"
+    print_ok "DNS 路由已配置: $tunnel_domain -> $tunnel_id"
+
+    cat > "$CONFIG_DIR/tunnel_info.txt" <<EOF
+TUNNEL_ID=${tunnel_id}
+TUNNEL_NAME=${tunnel_name:-unknown}
+TUNNEL_DOMAIN=${tunnel_domain}
+LOCAL_SERVICE=${local_service}
+CONFIG_FILE=${config_file}
+EOF
+
+    print_info "步骤 5: 启动隧道测试"
+    read -rp "是否立即启动隧道测试? [Y/n]: " start_now
+    if [[ ! "$start_now" =~ ^[Nn]$ ]]; then
+        print_info "正在启动隧道 (按 Ctrl+C 停止)..."
+        cloudflared tunnel --config "$config_file" run "$tunnel_id"
+    fi
+
+    print_ok "Argo 隧道配置完成!"
+    print_info "后续启动命令: cloudflared tunnel --config $config_file run $tunnel_id"
+    print_info "或后台运行: nohup cloudflared tunnel --config $config_file run $tunnel_id &"
+}
+
+# ---------- 3. 优选 IP 测速（完整内置 IP 列表，并发测速）----------
+speed_test_ip() {
+    local ip=$1
+    local ping_avg="9999"
+    local download_speed="0"
+    local loss_rate="100"
+
+    local ping_result=$(ping -c 4 -W 2 "$ip" 2>/dev/null | tail -1)
+    if [[ -n "$ping_result" ]]; then
+        ping_avg=$(echo "$ping_result" | awk -F'/' '{print $5}')
+        [[ -z "$ping_avg" ]] && ping_avg="9999"
+        local tx=$(ping -c 4 -W 2 "$ip" 2>/dev/null | grep -oP '\d+(?= packets transmitted)' || echo "4")
+        local rx=$(ping -c 4 -W 2 "$ip" 2>/dev/null | grep -oP '\d+(?= received)' || echo "0")
+        loss_rate=$(( (tx - rx) * 100 / tx ))
+    fi
+
+    if command -v curl &>/dev/null; then
+        local speed_test=$(curl -fsSL -o /dev/null -w "%{speed_download}" \
+            --connect-timeout 3 --max-time 5 \
+            -H "Host: speed.cloudflare.com" \
+            "http://${ip}/cdn-cgi/trace" 2>/dev/null || echo "0")
+        download_speed=$(echo "$speed_test" | awk '{printf "%.2f", $1/1024}')
+    fi
+
+    local score=$(awk "BEGIN {
+        ping = $ping_avg;
+        speed = $download_speed;
+        loss = $loss_rate;
+        if (loss > 50) { print 99999; exit }
+        if (ping == 9999 || ping == 0) { print 99999; exit }
+        if (speed <= 0) { speed = 0.01 }
+        score = ping * 0.6 + (1000 / speed) * 0.4;
+        print score
+    }")
+    echo "${ip}|${ping_avg}|${download_speed}|${loss_rate}|${score}"
+}
+
+run_speed_test() {
+    echo -e "\n${CYAN}========== Cloudflare 优选 IP 测速 ==========${NC}"
+    require_cmd ping || return 1
+
+    read -rp "测试 IP 数量 (默认 30, 最大 ${#CF_IP_LIST[@]}): " test_count
+    [[ -z "$test_count" ]] && test_count=30
+    (( test_count > ${#CF_IP_LIST[@]} )) && test_count=${#CF_IP_LIST[@]}
+
+    read -rp "并发线程数 (默认 10): " threads
+    [[ -z "$threads" ]] && threads=10
+
+    print_info "开始测试 ${test_count} 个 IP，并发 ${threads} 线程..."
+    local tmpresult=$(mktemp)
+    local count=0
+    local pids=()
+    local test_ips=($(printf "%s\n" "${CF_IP_LIST[@]}" | shuf | head -n "$test_count"))
+
+    for ip in "${test_ips[@]}"; do
+        {
+            local result=$(speed_test_ip "$ip")
+            echo "$result" >> "$tmpresult"
+        } &
+        pids+=($!)
+        while (( ${#pids[@]} >= threads )); do
+            for i in "${!pids[@]}"; do
+                if ! kill -0 "${pids[$i]}" 2>/dev/null; then
+                    unset 'pids[i]'
+                    ((count++))
+                    echo -ne "\r${YELLOW}进度: ${count}/${test_count}${NC}"
+                fi
+            done
+            sleep 0.1
+        done
+    done
+    wait
+    echo -e "\r${GREEN}进度: ${test_count}/${test_count}${NC}"
+
+    local sorted=$(sort -t'|' -k5 -n "$tmpresult" | head -20)
+    rm -f "$tmpresult"
+
+    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    printf "${GREEN}%-18s %10s %12s %8s %10s${NC}\n" "IP 地址" "延迟(ms)" "速度(KB/s)" "丢包%" "综合评分"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    local best_ip=""
+    while IFS='|' read -r ip ping speed loss score; do
+        [[ -z "$ip" ]] && continue
+        [[ -z "$best_ip" ]] && best_ip="$ip"
+        printf "%-18s %10s %12s %8s %10s\n" "$ip" "$ping" "$speed" "$loss" "$score"
+    done <<< "$sorted"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    if [[ -n "$best_ip" ]]; then
+        print_ok "最优 IP: ${best_ip}"
+        cat > "$RESULT_FILE" <<EOF
+BEST_IP=${best_ip}
+TEST_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+        read -rp "是否将最优 IP 写入 /etc/hosts? [y/N]: " write_hosts
+        [[ "$write_hosts" =~ ^[Yy]$ ]] && write_hosts_file "$best_ip"
+        read -rp "是否通过 Cloudflare API 更新 DNS A 记录? [y/N]: " update_dns
+        [[ "$update_dns" =~ ^[Yy]$ ]] && update_cloudflare_dns "$best_ip"
+    else
+        print_err "未找到可用 IP"
+    fi
+}
+
+# ---------- 4. DNS 更新 ----------
+update_cloudflare_dns() {
+    local ip=${1:-""}
+    echo -e "\n${CYAN}========== Cloudflare DNS 更新 ==========${NC}"
+    require_cmd curl || return 1
+
+    if [[ -z "$ip" && -f "$RESULT_FILE" ]]; then
+        ip=$(grep "BEST_IP=" "$RESULT_FILE" | cut -d'=' -f2)
+    fi
+    if [[ -z "$ip" ]]; then
+        read -rp "输入要设置的 IP 地址: " ip
+    fi
+    [[ -z "$ip" ]] && { print_err "IP 不能为空"; return 1; }
+
+    local api_token="" api_key="" email="" zone_id="" record_name=""
+    local cred_file="$CONFIG_DIR/cf_credentials.conf"
+    if [[ -f "$cred_file" ]]; then
+        source "$cred_file"
+        print_ok "已加载保存的 API 凭证"
+        read -rp "是否使用已有凭证? [Y/n]: " use_saved
+        [[ "$use_saved" =~ ^[Nn]$ ]] && { api_token=""; api_key=""; email=""; zone_id=""; record_name=""; }
+    fi
+
+    if [[ -z "$api_token" && -z "$api_key" ]]; then
+        echo "1) API Token (推荐)"
+        echo "2) Global API Key + Email"
+        read -rp "请选择 [1-2]: " auth_type
+        case "$auth_type" in
+            1) read -rsp "输入 API Token: " api_token; echo ;;
+            2) read -rp "输入 Email: " email; read -rsp "输入 Global API Key: " api_key; echo ;;
+            *) print_err "无效选择"; return 1 ;;
+        esac
+        read -rp "输入 Zone ID: " zone_id
+        read -rp "输入要更新的域名记录 (如: www.example.com): " record_name
+        cat > "$cred_file" <<EOF
+API_TOKEN=${api_token}
+API_KEY=${api_key}
+EMAIL=${email}
+ZONE_ID=${zone_id}
+RECORD_NAME=${record_name}
+EOF
+        chmod 600 "$cred_file"
+        print_ok "凭证已保存"
+    fi
+
+    [[ -z "$zone_id" || -z "$record_name" ]] && { print_err "Zone ID 或记录名缺失"; return 1; }
+
+    local auth_header=""
+    if [[ -n "$api_token" ]]; then
+        auth_header="Authorization: Bearer ${api_token}"
+    else
+        auth_header="X-Auth-Key: ${api_key}"
+    fi
+
+    local list_url="${CF_API_URL}/zones/${zone_id}/dns_records?type=A&name=${record_name}"
+    local list_response=$(curl -fsSL -X GET "$list_url" \
+        -H "Content-Type: application/json" \
+        -H "$auth_header" \
+        ${email:+-H "X-Auth-Email: ${email}"} 2>/dev/null || echo '{"success":false}')
+    local record_id=$(echo "$list_response" | grep -oP '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
+
+    local payload="{\"type\":\"A\",\"name\":\"${record_name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":false}"
+    if [[ -n "$record_id" ]]; then
+        print_info "更新现有 A 记录"
+        curl -fsSL -X PUT "${CF_API_URL}/zones/${zone_id}/dns_records/${record_id}" \
+            -H "Content-Type: application/json" -H "$auth_header" ${email:+-H "X-Auth-Email: ${email}"} \
+            -d "$payload" > /dev/null 2>&1 || { print_err "更新失败"; return 1; }
+    else
+        print_info "创建新 A 记录"
+        curl -fsSL -X POST "${CF_API_URL}/zones/${zone_id}/dns_records" \
+            -H "Content-Type: application/json" -H "$auth_header" ${email:+-H "X-Auth-Email: ${email}"} \
+            -d "$payload" > /dev/null 2>&1 || { print_err "创建失败"; return 1; }
+    fi
+    print_ok "DNS 记录更新成功: ${record_name} -> ${ip}"
+    echo "$(date) - ${record_name} -> ${ip}" >> "$LOG_DIR/dns_updates.log"
+}
+
+# ---------- 5. hosts 写入 ----------
+write_hosts_file() {
+    local ip=${1:-""}
+    local domain=${2:-""}
+    echo -e "\n${CYAN}========== 写入 /etc/hosts ==========${NC}"
+    if [[ -z "$ip" && -f "$RESULT_FILE" ]]; then
+        ip=$(grep "BEST_IP=" "$RESULT_FILE" | cut -d'=' -f2)
+    fi
+    if [[ -z "$ip" ]]; then
+        read -rp "输入 IP 地址: " ip
+    fi
+    [[ -z "$ip" ]] && { print_err "IP 不能为空"; return 1; }
+    if [[ -z "$domain" ]]; then
+        read -rp "输入要绑定的域名: " domain
+    fi
+    [[ -z "$domain" ]] && domain="your-domain.com"
+
+    local hosts_entry="${ip} ${domain} # CF-optimized-$(date +%s)"
+    sudo cp /etc/hosts /etc/hosts.bak.$(date +%s) 2>/dev/null || true
+    sudo sed -i "/${domain}.*# CF-optimized/d" /etc/hosts 2>/dev/null || true
+    echo "$hosts_entry" | sudo tee -a /etc/hosts > /dev/null
+    print_ok "已写入 /etc/hosts: ${ip} ${domain}"
+}
+
+# ---------- 6. Argo 隧道 + CNAME 优选路由 ----------
+setup_argo_cname() {
+    echo -e "\n${CYAN}========== Argo 隧道 + CNAME 优选路由 ==========${NC}"
+    require_cmd cloudflared || return 1
+
+    local tunnel_info="$CONFIG_DIR/tunnel_info.txt"
+    if [[ ! -f "$tunnel_info" ]]; then
+        print_err "请先配置 Argo 隧道 (选项 2)"
+        return 1
+    fi
+    source "$tunnel_info"
+
+    local best_ip=""
+    if [[ -f "$RESULT_FILE" ]]; then
+        best_ip=$(grep "BEST_IP=" "$RESULT_FILE" | cut -d'=' -f2)
+    fi
+    if [[ -z "$best_ip" ]]; then
+        print_warn "未找到测速结果，请先运行测速 (选项 3)"
+        read -rp "手动输入优选 IP: " best_ip
+    fi
+    [[ -z "$best_ip" ]] && { print_err "缺少优选 IP"; return 1; }
+
+    print_info "配置本地 hosts 指向优选 IP: ${best_ip}"
+    read -rp "是否在本地 hosts 中将 ${TUNNEL_DOMAIN} 指向 ${best_ip}? [Y/n]: " set_local
+    if [[ ! "$set_local" =~ ^[Nn]$ ]]; then
+        write_hosts_file "$best_ip" "$TUNNEL_DOMAIN"
+    fi
+
+    print_info "配置 DNS CNAME 记录指向 Argo 隧道"
+    local cname_target="${TUNNEL_ID}.cfargotunnel.com"
+    read -rp "输入要创建 CNAME 的域名 (如: argo.example.com): " cname_domain
+    [[ -z "$cname_domain" ]] && { print_err "域名不能为空"; return 1; }
+
+    local cred_file="$CONFIG_DIR/cf_credentials.conf"
+    if [[ ! -f "$cred_file" ]]; then
+        print_err "请先配置 Cloudflare API 凭证 (选项 4)"
+        return 1
+    fi
+    source "$cred_file"
+    [[ -z "$zone_id" ]] && { print_err "Zone ID 未配置"; return 1; }
+
+    local auth_header=""
+    if [[ -n "$api_token" ]]; then
+        auth_header="Authorization: Bearer ${api_token}"
+    else
+        auth_header="X-Auth-Key: ${api_key}"
+    fi
+
+    local payload="{\"type\":\"CNAME\",\"name\":\"${cname_domain}\",\"content\":\"${cname_target}\",\"ttl\":120,\"proxied\":true}"
+    local list_url="${CF_API_URL}/zones/${zone_id}/dns_records?type=CNAME&name=${cname_domain}"
+    local list_response=$(curl -fsSL -X GET "$list_url" -H "Content-Type: application/json" -H "$auth_header" ${email:+-H "X-Auth-Email: ${email}"} 2>/dev/null)
+    local record_id=$(echo "$list_response" | grep -oP '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
+
+    if [[ -n "$record_id" ]]; then
+        curl -fsSL -X PUT "${CF_API_URL}/zones/${zone_id}/dns_records/${record_id}" \
+            -H "Content-Type: application/json" -H "$auth_header" ${email:+-H "X-Auth-Email: ${email}"} \
+            -d "$payload" > /dev/null 2>&1 || { print_err "CNAME 更新失败"; return 1; }
+    else
+        curl -fsSL -X POST "${CF_API_URL}/zones/${zone_id}/dns_records" \
+            -H "Content-Type: application/json" -H "$auth_header" ${email:+-H "X-Auth-Email: ${email}"} \
+            -d "$payload" > /dev/null 2>&1 || { print_err "CNAME 创建失败"; return 1; }
+    fi
+    print_ok "CNAME 配置完成: ${cname_domain} -> ${cname_target}"
+    echo "CNAME_DOMAIN=${cname_domain}" >> "$CONFIG_DIR/argo_cname.conf"
+}
+
+# ---------- 7. 安装代理内核（Xray / Sing-box）并自动对接隧道 ----------
+install_proxy_core() {
+    echo -e "\n${CYAN}========== 安装代理内核 ==========${NC}"
+    echo "1) Xray (VLESS/VMess + WebSocket)"
+    echo "2) Sing-box (轻量级，支持多种协议)"
+    read -rp "请选择 [1-2]: " core_choice
+
+    local core_type="" protocol_type=""
+    case "$core_choice" in
+        1) core_type="xray" ;;
+        2) core_type="singbox" ;;
+        *) print_err "无效选择"; return 1 ;;
+    esac
+
+    echo "选择协议:"
+    echo "1) VLESS + WebSocket (推荐)"
+    echo "2) VMess + WebSocket (兼容性好)"
+    read -rp "请选择 [1-2]: " proto_choice
+    case "$proto_choice" in
+        1) protocol_type="vless" ;;
+        2) protocol_type="vmess" ;;
+        *) print_err "无效选择"; return 1 ;;
+    esac
+
+    local uuid=$(cat /proc/sys/kernel/random/uuid)
+    local port=8443
+    local ws_path="/${uuid//-/}"
+    print_info "生成的 UUID: ${uuid}"
+    print_info "WebSocket 路径: ${ws_path}"
+
+    if [[ "$core_type" == "xray" ]]; then
+        print_info "安装 Xray..."
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        mkdir -p /usr/local/etc/xray
+        if [[ "$protocol_type" == "vless" ]]; then
+            cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "log": { "loglevel": "info" },
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": ${port},
+    "protocol": "vless",
+    "settings": {
+      "clients": [ { "id": "${uuid}", "flow": "" } ],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "ws",
+      "wsSettings": { "path": "${ws_path}" }
+    }
+  }],
+  "outbounds": [ { "protocol": "freedom" } ]
+}
+EOF
+        else
+            cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "log": { "loglevel": "info" },
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": ${port},
+    "protocol": "vmess",
+    "settings": {
+      "clients": [ { "id": "${uuid}" } ]
+    },
+    "streamSettings": {
+      "network": "ws",
+      "wsSettings": { "path": "${ws_path}" }
+    }
+  }],
+  "outbounds": [ { "protocol": "freedom" } ]
+}
+EOF
+        fi
+        systemctl restart xray
+        systemctl enable xray
+    elif [[ "$core_type" == "singbox" ]]; then
+        print_info "安装 Sing-box..."
+        bash -c "$(curl -fsSL https://raw.githubusercontent.com/chise0713/sing-box-installer/master/sing-box-installer.sh)"
+        mkdir -p /etc/sing-box
+        cat > /etc/sing-box/config.json <<EOF
+{
+  "log": { "level": "info" },
+  "inbounds": [{
+    "type": "${protocol_type}",
+    "listen": "127.0.0.1",
+    "listen_port": ${port},
+    "users": [ { "uuid": "${uuid}", "name": "default" } ],
+    "transport": { "type": "ws", "path": "${ws_path}" }
+  }],
+  "outbounds": [ { "type": "direct" } ]
+}
+EOF
+        systemctl restart sing-box
+        systemctl enable sing-box
+    fi
+
+    print_ok "${core_type} 安装完成，代理监听在 127.0.0.1:${port}"
+    cat > "$CONFIG_DIR/proxy_info.txt" <<EOF
+代理类型: ${core_type}
+协议: ${protocol_type}
+端口: ${port}
+UUID: ${uuid}
+WebSocket 路径: ${ws_path}
+EOF
+    cat "$CONFIG_DIR/proxy_info.txt"
+
+    # 自动对接现有隧道
+    if [[ -f "$CONFIG_DIR/tunnel_info.txt" ]]; then
+        read -rp "检测到已有 Argo 隧道，是否将隧道本地服务地址修改为 http://127.0.0.1:${port} ？[Y/n]: " modify_tunnel
+        if [[ ! "$modify_tunnel" =~ ^[Nn]$ ]]; then
+            source "$CONFIG_DIR/tunnel_info.txt"
+            local config_file="$CONFIG_DIR/${TUNNEL_ID}.yml"
+            if [[ -f "$config_file" ]]; then
+                sed -i "s|service: .*|service: http://127.0.0.1:${port}|" "$config_file"
+                print_ok "隧道配置已更新，本地服务指向代理端口 ${port}"
+                systemctl restart cloudflared-${TUNNEL_NAME} 2>/dev/null || {
+                    print_warn "未找到 systemd 服务，请手动重启隧道"
+                }
+            fi
+        fi
+    else
+        print_warn "未检测到 Argo 隧道，请先配置隧道 (选项 2) 后再将本地服务指向 ${port}"
+    fi
+}
+
+# ---------- 8. 定时自动优选 ----------
+setup_cron() {
+    echo -e "\n${CYAN}========== 定时自动优选 ==========${NC}"
+    read -rp "执行间隔 (小时，默认 6): " interval
+    [[ -z "$interval" ]] && interval=6
+    local script_path="${SCRIPT_DIR}/$(basename "$0")"
+    local auto_script="$CONFIG_DIR/auto_optimize.sh"
+    cat > "$auto_script" <<EOF
+#!/bin/bash
+export PATH=/usr/local/bin:/usr/bin:/bin
+bash "$script_path" --auto-test
+bash "$script_path" --auto-dns
+EOF
+    chmod +x "$auto_script"
+    (crontab -l 2>/dev/null | grep -v "$auto_script"; echo "0 */${interval} * * * $auto_script") | crontab -
+    print_ok "定时任务已设置，每 ${interval} 小时执行一次"
+}
+
+# ---------- 9. 查看状态 ----------
+show_status() {
+    echo -e "\n${CYAN}========== 系统状态 ==========${NC}"
+    echo -e "\n${YELLOW}[cloudflared]${NC}"
+    command -v cloudflared &>/dev/null && cloudflared --version || echo "未安装"
+    echo -e "\n${YELLOW}[隧道配置]${NC}"
+    [[ -f "$CONFIG_DIR/tunnel_info.txt" ]] && cat "$CONFIG_DIR/tunnel_info.txt" || echo "未配置"
+    echo -e "\n${YELLOW}[优选 IP 结果]${NC}"
+    [[ -f "$RESULT_FILE" ]] && cat "$RESULT_FILE" || echo "未测速"
+    echo -e "\n${YELLOW}[API 凭证]${NC}"
+    [[ -f "$CONFIG_DIR/cf_credentials.conf" ]] && echo "已配置" || echo "未配置"
+    echo -e "\n${YELLOW}[代理内核]${NC}"
+    if [[ -f "$CONFIG_DIR/proxy_info.txt" ]]; then
+        cat "$CONFIG_DIR/proxy_info.txt"
+    else
+        echo "未安装"
+    fi
+    echo -e "\n${YELLOW}[定时任务]${NC}"
+    crontab -l 2>/dev/null | grep -i "auto_optimize" || echo "未设置"
+}
+
+# ---------- 非交互模式 ----------
+auto_test() {
+    print_info "自动测速模式 (非交互)"
+    local test_count=50 threads=15
+    local tmpresult=$(mktemp)
+    local test_ips=($(printf "%s\n" "${CF_IP_LIST[@]}" | shuf | head -n "$test_count"))
+    for ip in "${test_ips[@]}"; do
+        speed_test_ip "$ip" >> "$tmpresult" &
+    done
+    wait
+    local best=$(sort -t'|' -k5 -n "$tmpresult" | head -1)
+    rm -f "$tmpresult"
+    local best_ip=$(echo "$best" | cut -d'|' -f1)
+    cat > "$RESULT_FILE" <<EOF
+BEST_IP=${best_ip}
+TEST_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+    print_ok "自动测速完成: ${best_ip}"
+}
+
+auto_dns() {
+    if [[ -f "$RESULT_FILE" ]]; then
+        local ip=$(grep "BEST_IP=" "$RESULT_FILE" | cut -d'=' -f2)
+        update_cloudflare_dns "$ip"
+    else
+        print_err "没有测速结果"
+    fi
+}
+
+# ---------- 主菜单 ----------
+show_menu() {
+    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}  主菜单${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${GREEN}1${NC}. 安装/更新 cloudflared"
+    echo -e "  ${GREEN}2${NC}. 配置 Argo 隧道"
+    echo -e "  ${GREEN}3${NC}. 优选 IP 测速"
+    echo -e "  ${GREEN}4${NC}. Cloudflare DNS 更新 (A 记录)"
+    echo -e "  ${GREEN}5${NC}. 写入 /etc/hosts"
+    echo -e "  ${GREEN}6${NC}. Argo 隧道 + CNAME 优选路由"
+    echo -e "  ${GREEN}7${NC}. 安装代理内核 (Xray/Sing-box) 并自动对接隧道"
+    echo -e "  ${GREEN}8${NC}. 设置定时自动优选"
+    echo -e "  ${GREEN}9${NC}. 查看系统状态"
+    echo -e "  ${GREEN}0${NC}. 退出"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+main() {
+    ensure_dirs
+
+    case "${1:-}" in
+        --auto-test) auto_test; exit 0 ;;
+        --auto-dns)  auto_dns; exit 0 ;;
+    esac
+
+    print_banner
+    while true; do
+        show_menu
+        read -rp "请选择 [0-9]: " choice
+        case "$choice" in
+            1) install_cloudflared ;;
+            2) setup_argo_tunnel ;;
+            3) run_speed_test ;;
+            4) update_cloudflare_dns ;;
+            5) write_hosts_file ;;
+            6) setup_argo_cname ;;
+            7) install_proxy_core ;;
+            8) setup_cron ;;
+            9) show_status ;;
+            0) print_ok "再见!"; exit 0 ;;
+            *) print_err "无效选择" ;;
+        esac
+        echo ""
+        read -rp "按 Enter 返回菜单..."
+    done
+}
+
+main "$@"
