@@ -1,916 +1,236 @@
 #!/bin/bash
 # ============================================================
-# Cloudflared + Argo 隧道 + 代理内核 全功能管理脚本
-# 版本: 2.0 (修复版)
+# 全自动 Cloudflared + Argo 隧道 + 代理内核 部署脚本
+# 版本: auto-v1.0
+# 使用方式:
+#   交互模式:   ./cf-auto.sh
+#   自动模式:   CF_EMAIL=... CF_API_KEY=... DOMAIN=... ./cf-auto.sh --auto
 # ============================================================
-
 set -e
 
-# ---------- 颜色定义 ----------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-# ---------- 配置变量 ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.cloudflare-config"
-LOG_DIR="$CONFIG_DIR/logs"
-CF_API_URL="https://api.cloudflare.com/client/v4"
-MAX_RETRIES=5
-RETRY_DELAY=2
-
-# ---------- 工具函数 ----------
-print_banner() {
-    echo -e "${CYAN}"
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║   Cloudflared + Argo 隧道 + 代理内核 管理工具 v2.0          ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
 print_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 print_err()  { echo -e "${RED}[ERR]${NC} $1"; }
 
-require_cmd() {
-    if ! command -v "$1" &>/dev/null; then
-        print_err "缺少命令: $1，请先安装"
-        return 1
+CONFIG_DIR="$HOME/.cloudflare-config"
+LOG_DIR="$CONFIG_DIR/logs"
+mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+
+has_systemd() { [[ -d /run/systemd/system || $(ps --no-headers -o comm 1 2>/dev/null) == "systemd" ]]; }
+
+# ---------- 安装依赖 ----------
+install_deps() {
+    local missing=()
+    for cmd in curl wget tar python3; do
+        command -v $cmd &>/dev/null || missing+=($cmd)
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return
+    print_info "安装依赖: ${missing[*]}"
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq && apt-get install -y ${missing[*]}
+    elif command -v yum &>/dev/null; then
+        yum install -y ${missing[*]}
+    elif command -v apk &>/dev/null; then
+        apk add ${missing[*]}
+    else
+        print_warn "请手动安装: ${missing[*]}"
     fi
-    return 0
 }
 
-ensure_dirs() {
-    mkdir -p "$CONFIG_DIR" "$LOG_DIR"
-}
-
-# ---------- API 请求重试函数 ----------
-curl_with_retry() {
-    local method="$1"
-    local url="$2"
-    local headers=()
-    local data=""
-    local retry_count=0
-
-    shift 2
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -H) headers+=("$2"); shift 2 ;;
-            -d) data="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-
-    while (( retry_count < MAX_RETRIES )); do
-        print_info "API 请求 (尝试 $((retry_count + 1))/$MAX_RETRIES)..."
-        
-        local cmd="curl -fsSL -X $method '$url'"
-        for header in "${headers[@]}"; do
-            cmd="$cmd -H '$header'"
-        done
-        if [[ -n "$data" ]]; then
-            cmd="$cmd -d '$data'"
-        fi
-        
-        local response=$(eval "$cmd" 2>/dev/null)
-        
-        if echo "$response" | grep -q '"success":true'; then
-            echo "$response"
-            return 0
-        fi
-        
-        local error_msg=$(echo "$response" | grep -oP '"message":"[^"]+"' | head -1 | cut -d'"' -f4)
-        print_warn "API 返回错误: ${error_msg:-未知错误}"
-        
-        ((retry_count++))
-        if (( retry_count < MAX_RETRIES )); then
-            print_warn "等待 ${RETRY_DELAY} 秒后重试..."
-            sleep "$RETRY_DELAY"
-        fi
-    done
-    
-    print_err "API 请求失败，已尝试 $MAX_RETRIES 次"
-    return 1
-}
-
-# ---------- 1. 安装 cloudflared ----------
+# ---------- 安装 cloudflared ----------
 install_cloudflared() {
-    echo -e "\n${CYAN}========== 安装 cloudflared ==========${NC}"
     if command -v cloudflared &>/dev/null; then
-        local ver=$(cloudflared --version 2>/dev/null | head -1)
-        print_ok "cloudflared 已安装: $ver"
-        read -rp "是否重新安装/更新? [y/N]: " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+        print_ok "cloudflared 已安装: $(cloudflared --version | head -1)"
+        return
     fi
-
     local arch=$(uname -m)
+    case $arch in x86_64|amd64) arch="amd64";; aarch64|arm64) arch="arm64";; armv7l) arch="arm";; *) print_err "不支持的架构"; exit 1;; esac
     local os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    local download_url=""
-
-    case "$arch" in
-        x86_64|amd64)  arch="amd64" ;;
-        aarch64|arm64) arch="arm64" ;;
-        armv7l|armv7)  arch="arm" ;;
-        i386|i686)     arch="386" ;;
-        *) print_err "不支持的架构: $arch"; return 1 ;;
-    esac
-
-    case "$os" in
-        linux)   download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" ;;
-        darwin)  download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${arch}" ;;
-        *) print_err "不支持的操作系统: $os"; return 1 ;;
-    esac
-
-    print_info "正在下载: $download_url"
-    local tmpfile=$(mktemp)
-    if curl -fsSL -o "$tmpfile" "$download_url"; then
-        print_ok "下载成功"
-    else
-        print_err "下载失败"
-        rm -f "$tmpfile"
-        return 1
-    fi
-
-    chmod +x "$tmpfile"
-    if [[ "$os" == "linux" ]]; then
-        sudo mv "$tmpfile" /usr/local/bin/cloudflared 2>/dev/null || {
-            print_warn "无法写入 /usr/local/bin，尝试写入 ~/.local/bin"
-            mkdir -p ~/.local/bin
-            mv "$tmpfile" ~/.local/bin/cloudflared
-            export PATH="$HOME/.local/bin:$PATH"
-            echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-        }
-    else
-        sudo mv "$tmpfile" /usr/local/bin/cloudflared 2>/dev/null || mv "$tmpfile" /usr/local/bin/cloudflared
-    fi
-
+    local dl="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${os}-${arch}"
+    print_info "下载 cloudflared..."
+    local tmp=$(mktemp)
+    curl -fsSL -o "$tmp" "$dl" || { print_err "下载失败"; exit 1; }
+    chmod +x "$tmp"
+    mv "$tmp" /usr/local/bin/cloudflared 2>/dev/null || { mkdir -p ~/.local/bin; mv "$tmp" ~/.local/bin/cloudflared; export PATH="$HOME/.local/bin:$PATH"; }
     print_ok "cloudflared 安装完成"
-    cloudflared --version
 }
 
-# ---------- 2. Argo 隧道配置 ----------
-setup_argo_tunnel() {
-    echo -e "\n${CYAN}========== 配置 Argo 隧道 ==========${NC}"
-    require_cmd cloudflared || return 1
-
-    # 步骤 1: 登录认证
-    print_info "步骤 1: 登录 Cloudflare 认证"
-    local auth_type=""
-    if [[ -f "$HOME/.cloudflared/cert.pem" ]]; then
-        print_ok "已检测到认证文件"
-        read -rp "是否重新认证? [y/N]: " reauth
-        [[ ! "$reauth" =~ ^[Yy]$ ]] && auth_type="skip"
+# ---------- 安装代理内核 (Sing-box) ----------
+install_singbox() {
+    if command -v sing-box &>/dev/null; then
+        print_ok "Sing-box 已安装: $(sing-box version 2>&1 | head -1)"
+        return
     fi
-
-    if [[ "$auth_type" != "skip" ]]; then
-        echo "选择认证方式:"
-        echo "1) 浏览器认证 (默认)"
-        echo "2) Email + Global API Key"
-        read -rp "请选择 [1-2]: " auth_choice
-        case "$auth_choice" in
-            2)
-                read -rp "输入 Cloudflare 注册邮箱: " cf_email
-                read -rsp "输入 Global API Key: " cf_apikey; echo
-                if [[ -z "$cf_email" || -z "$cf_apikey" ]]; then
-                    print_err "邮箱和 API Key 不能为空"; return 1
-                fi
-                print_info "使用 API Key 认证..."
-                cloudflared tunnel login --email "$cf_email" --api-key "$cf_apikey"
-                ;;
-            *)
-                print_info "使用浏览器认证..."
-                cloudflared tunnel login
-                ;;
-        esac
-    fi
-
-    # 步骤 2: 创建/选择隧道
-    print_info "步骤 2: 创建/选择隧道"
-    echo "1) 创建新隧道"
-    echo "2) 列出已有隧道"
-    echo "3) 使用已有隧道"
-    read -rp "请选择 [1-3]: " tunnel_choice
-
-    local tunnel_id=""
-    local tunnel_name=""
-
-    case "$tunnel_choice" in
-        1)
-            read -rp "输入隧道名称 (如: my-tunnel): " tunnel_name
-            [[ -z "$tunnel_name" ]] && { print_err "名称不能为空"; return 1; }
-            print_info "正在创建隧道: $tunnel_name"
-            cloudflared tunnel create "$tunnel_name"
-            tunnel_id=$(cloudflared tunnel list | grep "$tunnel_name" | awk '{print $1}')
-            print_ok "隧道创建成功，ID: $tunnel_id"
-            ;;
-        2)
-            print_info "已有隧道列表:"
-            cloudflared tunnel list
-            read -rp "输入要使用的隧道 ID: " tunnel_id
-            ;;
-        3)
-            read -rp "输入隧道 ID: " tunnel_id
-            ;;
-        *)
-            print_err "无效选择"
-            return 1
-            ;;
-    esac
-
-    [[ -z "$tunnel_id" ]] && { print_err "隧道 ID 无效"; return 1; }
-
-    # 步骤 3: 配置隧道路由
-    print_info "步骤 3: 配置隧道路由"
-    read -rp "输入要代理的本地服务地址 (默认: http://localhost:8080): " local_service
-    [[ -z "$local_service" ]] && local_service="http://localhost:8080"
-    
-    read -rp "输入要绑定的域名 (如: tunnel.example.com): " tunnel_domain
-    [[ -z "$tunnel_domain" ]] && { print_err "域名不能为空"; return 1; }
-
-    local config_file="$CONFIG_DIR/${tunnel_id}.yml"
-    cat > "$config_file" <<EOF
-tunnel: ${tunnel_id}
-credentials-file: ${HOME}/.cloudflared/${tunnel_id}.json
-
-ingress:
-  - hostname: ${tunnel_domain}
-    service: ${local_service}
-  - service: http_status:404
-EOF
-
-    print_info "配置文件已保存: $config_file"
-    cat "$config_file"
-
-    # 步骤 4: 配置 DNS 路由
-    print_info "步骤 4: 配置 DNS 路由"
-    cloudflared tunnel route dns "$tunnel_id" "$tunnel_domain"
-    print_ok "DNS 路由已配置: $tunnel_domain -> $tunnel_id"
-
-    # 保存隧道信息
-    cat > "$CONFIG_DIR/tunnel_info.txt" <<EOF
-TUNNEL_ID=${tunnel_id}
-TUNNEL_NAME=${tunnel_name:-unknown}
-TUNNEL_DOMAIN=${tunnel_domain}
-LOCAL_SERVICE=${local_service}
-CONFIG_FILE=${config_file}
-EOF
-
-    # 步骤 5: 启动隧道测试
-    print_info "步骤 5: 启动隧道测试"
-    read -rp "是否立即启动隧道测试? [Y/n]: " start_now
-    if [[ ! "$start_now" =~ ^[Nn]$ ]]; then
-        print_info "正在启动隧道 (按 Ctrl+C 停止)..."
-        cloudflared tunnel --config "$config_file" run "$tunnel_id"
-    fi
-
-    print_ok "Argo 隧道配置完成!"
+    local arch=$(uname -m)
+    case $arch in x86_64) arch="amd64";; aarch64) arch="arm64";; *) print_err "不支持的架构"; exit 1;; esac
+    cd /tmp
+    local ver=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d '"' -f 4)
+    local dl="https://github.com/SagerNet/sing-box/releases/download/${ver}/sing-box-${ver#v}-linux-${arch}.tar.gz"
+    curl -L -o sb.tar.gz "$dl" || { print_err "下载失败"; exit 1; }
+    tar -xzf sb.tar.gz
+    mv sing-box-*/sing-box /usr/local/bin/
+    chmod +x /usr/local/bin/sing-box
+    rm -rf sing-box-* sb.tar.gz
+    print_ok "Sing-box 安装完成"
 }
 
-# ---------- 3. DNS 更新 ----------
-update_cloudflare_dns() {
-    echo -e "\n${CYAN}========== Cloudflare DNS 更新 ==========${NC}"
-    require_cmd curl || return 1
-
-    read -rp "输入要设置的 IP 地址: " ip
-    [[ -z "$ip" ]] && { print_err "IP 不能为空"; return 1; }
-
-    local api_token="" api_key="" email="" zone_id="" record_name=""
-    local cred_file="$CONFIG_DIR/cf_credentials.conf"
-    
-    if [[ -f "$cred_file" ]]; then
-        source "$cred_file"
-        print_ok "已加载保存的 API 凭证"
-        read -rp "是否使用已有凭证? [Y/n]: " use_saved
-        [[ "$use_saved" =~ ^[Nn]$ ]] && { api_token=""; api_key=""; email=""; zone_id=""; record_name=""; }
-    fi
-
-    # API 凭证输入
-    if [[ -z "$api_token" && -z "$api_key" ]]; then
-        echo "1) API Token (推荐)"
-        echo "2) Global API Key + Email"
-        read -rp "请选择 [1-2]: " auth_type
-        case "$auth_type" in
-            1) read -rsp "输入 API Token: " api_token; echo ;;
-            2) read -rp "输入 Email: " email; read -rsp "输入 Global API Key: " api_key; echo ;;
-            *) print_err "无效选择"; return 1 ;;
-        esac
-        read -rp "输入 Zone ID: " zone_id
-        read -rp "输入要更新的域名记录 (如: www.example.com): " record_name
-    fi
-
-    [[ -z "$zone_id" || -z "$record_name" ]] && { print_err "Zone ID 或记录名缺失"; return 1; }
-
-    local auth_header=""
-    if [[ -n "$api_token" ]]; then
-        auth_header="Authorization: Bearer ${api_token}"
-    else
-        auth_header="X-Auth-Key: ${api_key}"
-    fi
-
-    # 保存凭证
-    cat > "$cred_file" <<EOF
-API_TOKEN=${api_token}
-API_KEY=${api_key}
-EMAIL=${email}
-ZONE_ID=${zone_id}
-RECORD_NAME=${record_name}
-EOF
-    chmod 600 "$cred_file"
-
-    # 获取现有 DNS 记录
-    local list_url="${CF_API_URL}/zones/${zone_id}/dns_records?type=A&name=${record_name}"
-    local list_response=$(curl_with_retry "GET" "$list_url" \
-        -H "Content-Type: application/json" \
-        -H "$auth_header" \
-        ${email:+-H "X-Auth-Email: ${email}"}) || return 1
-    
-    local record_id=$(echo "$list_response" | grep -oP '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
-    local payload="{\"type\":\"A\",\"name\":\"${record_name}\",\"content\":\"${ip}\",\"ttl\":120,\"proxied\":false}"
-    
-    if [[ -n "$record_id" ]]; then
-        print_info "更新现有 A 记录"
-        curl_with_retry "PUT" "${CF_API_URL}/zones/${zone_id}/dns_records/${record_id}" \
-            -H "Content-Type: application/json" \
-            -H "$auth_header" \
-            ${email:+-H "X-Auth-Email: ${email}"} \
-            -d "$payload" > /dev/null || return 1
-    else
-        print_info "创建新 A 记录"
-        curl_with_retry "POST" "${CF_API_URL}/zones/${zone_id}/dns_records" \
-            -H "Content-Type: application/json" \
-            -H "$auth_header" \
-            ${email:+-H "X-Auth-Email: ${email}"} \
-            -d "$payload" > /dev/null || return 1
-    fi
-    
-    print_ok "DNS 记录更新成功: ${record_name} -> ${ip}"
-    echo "$(date) - ${record_name} -> ${ip}" >> "$LOG_DIR/dns_updates.log"
+# ---------- 生成随机配置 ----------
+generate_random_config() {
+    UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+    PORT=8443
+    WSPATH="/${UUID//-/}"
+    PROTOCOL="vless"   # 默认VLESS
 }
 
-# ---------- 4. hosts 写入 ----------
-write_hosts_file() {
-    local ip=${1:-""}
-    local domain=${2:-""}
-    echo -e "\n${CYAN}========== 写入 /etc/hosts ==========${NC}"
-    if [[ -z "$ip" ]]; then
-        read -rp "输入 IP 地址: " ip
-    fi
-    [[ -z "$ip" ]] && { print_err "IP 不能为空"; return 1; }
-    if [[ -z "$domain" ]]; then
-        read -rp "输入要绑定的域名: " domain
-    fi
-    [[ -z "$domain" ]] && domain="your-domain.com"
-
-    local hosts_entry="${ip} ${domain} # CF-optimized-$(date +%s)"
-    sudo cp /etc/hosts /etc/hosts.bak.$(date +%s) 2>/dev/null || true
-    sudo sed -i "/${domain}.*# CF-optimized/d" /etc/hosts 2>/dev/null || true
-    echo "$hosts_entry" | sudo tee -a /etc/hosts > /dev/null
-    print_ok "已写入 /etc/hosts: ${ip} ${domain}"
-}
-
-# ---------- 5. Argo 隧道 + CNAME 优选路由 ----------
-setup_argo_cname() {
-    echo -e "\n${CYAN}========== Argo 隧道 + CNAME 优选路由 ==========${NC}"
-    
-    local tunnel_info="$CONFIG_DIR/tunnel_info.txt"
-    if [[ ! -f "$tunnel_info" ]]; then
-        print_err "请先配置 Argo 隧道 (选项 2)"
-        return 1
-    fi
-    source "$tunnel_info"
-
-    read -rp "输入优选 IP: " best_ip
-    [[ -z "$best_ip" ]] && { print_err "缺少优选 IP"; return 1; }
-
-    read -rp "是否在本地 hosts 中将 ${TUNNEL_DOMAIN} 指向 ${best_ip}? [Y/n]: " set_local
-    if [[ ! "$set_local" =~ ^[Nn]$ ]]; then
-        write_hosts_file "$best_ip" "$TUNNEL_DOMAIN"
-    fi
-
-    local cname_target="${TUNNEL_ID}.cfargotunnel.com"
-    read -rp "输入要创建 CNAME 的域名: " cname_domain
-    [[ -z "$cname_domain" ]] && { print_err "域名不能为空"; return 1; }
-
-    local cred_file="$CONFIG_DIR/cf_credentials.conf"
-    if [[ ! -f "$cred_file" ]]; then
-        print_err "请先配置 Cloudflare API 凭证 (选项 3)"
-        return 1
-    fi
-    source "$cred_file"
-
-    local auth_header=""
-    if [[ -n "$api_token" ]]; then
-        auth_header="Authorization: Bearer ${api_token}"
-    else
-        auth_header="X-Auth-Key: ${api_key}"
-    fi
-
-    local payload="{\"type\":\"CNAME\",\"name\":\"${cname_domain}\",\"content\":\"${cname_target}\",\"ttl\":120,\"proxied\":true}"
-    local list_url="${CF_API_URL}/zones/${zone_id}/dns_records?type=CNAME&name=${cname_domain}"
-    local list_response=$(curl_with_retry "GET" "$list_url" \
-        -H "Content-Type: application/json" \
-        -H "$auth_header" \
-        ${email:+-H "X-Auth-Email: ${email}"}) || return 1
-    
-    local record_id=$(echo "$list_response" | grep -oP '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
-
-    if [[ -n "$record_id" ]]; then
-        curl_with_retry "PUT" "${CF_API_URL}/zones/${zone_id}/dns_records/${record_id}" \
-            -H "Content-Type: application/json" \
-            -H "$auth_header" \
-            ${email:+-H "X-Auth-Email: ${email}"} \
-            -d "$payload" > /dev/null || return 1
-    else
-        curl_with_retry "POST" "${CF_API_URL}/zones/${zone_id}/dns_records" \
-            -H "Content-Type: application/json" \
-            -H "$auth_header" \
-            ${email:+-H "X-Auth-Email: ${email}"} \
-            -d "$payload" > /dev/null || return 1
-    fi
-    
-    print_ok "CNAME 配置完成: ${cname_domain} -> ${cname_target}"
-    echo "CNAME_DOMAIN=${cname_domain}" >> "$CONFIG_DIR/argo_cname.conf"
-}
-
-# ---------- 6. 安装代理内核（修复版）----------
-install_proxy_core() {
-    echo -e "\n${CYAN}========== 安装代理内核 ==========${NC}"
-    echo "1) Xray (VLESS/VMess + WebSocket)"
-    echo "2) Sing-box (轻量级，支持多种协议)"
-    read -rp "请选择 [1-2]: " core_choice
-
-    local core_type="" protocol_type=""
-    case "$core_choice" in
-        1) core_type="xray" ;;
-        2) core_type="singbox" ;;
-        *) print_err "无效选择"; return 1 ;;
-    esac
-
-    echo "选择协议:"
-    echo "1) VLESS + WebSocket (推荐)"
-    echo "2) VMess + WebSocket"
-    read -rp "请选择 [1-2]: " proto_choice
-    case "$proto_choice" in
-        1) protocol_type="vless" ;;
-        2) protocol_type="vmess" ;;
-        *) print_err "无效选择"; return 1 ;;
-    esac
-
-    local uuid=$(cat /proc/sys/kernel/random/uuid)
-    local port=8443
-    local ws_path="/${uuid//-/}"
-    print_info "UUID: ${uuid}"
-    print_info "WebSocket 路径: ${ws_path}"
-
-    # 安装代理核心
-    if [[ "$core_type" == "xray" ]]; then
-        print_info "安装 Xray..."
-        if ! command -v xray &>/dev/null; then
-            bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-        else
-            print_ok "Xray 已安装"
-        fi
-        
-        sudo mkdir -p /usr/local/etc/xray
-        if [[ "$protocol_type" == "vless" ]]; then
-            sudo tee /usr/local/etc/xray/config.json > /dev/null <<EOF
+# ---------- 启动代理服务 ----------
+start_proxy_service() {
+    mkdir -p /etc/sing-box
+    cat > /etc/sing-box/config.json <<EOF
 {
-  "log": { "loglevel": "info" },
-  "inbounds": [{
-    "listen": "127.0.0.1",
-    "port": ${port},
-    "protocol": "vless",
-    "settings": {
-      "clients": [ { "id": "${uuid}" } ],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "ws",
-      "wsSettings": { "path": "${ws_path}" }
-    }
-  }],
-  "outbounds": [ { "protocol": "freedom" } ]
-}
-EOF
-        else
-            sudo tee /usr/local/etc/xray/config.json > /dev/null <<EOF
-{
-  "log": { "loglevel": "info" },
-  "inbounds": [{
-    "listen": "127.0.0.1",
-    "port": ${port},
-    "protocol": "vmess",
-    "settings": {
-      "clients": [ { "id": "${uuid}" } ]
-    },
-    "streamSettings": {
-      "network": "ws",
-      "wsSettings": { "path": "${ws_path}" }
-    }
-  }],
-  "outbounds": [ { "protocol": "freedom" } ]
-}
-EOF
-        fi
-        sudo systemctl restart xray
-        sudo systemctl enable xray
-        print_ok "Xray 安装完成"
-        
-    elif [[ "$core_type" == "singbox" ]]; then
-        print_info "安装 Sing-box..."
-        
-        # 检查是否已安装
-        if command -v sing-box &>/dev/null; then
-            print_ok "Sing-box 已安装: $(sing-box version 2>&1 | head -1)"
-        else
-            # 下载并安装 Sing-box
-            local singbox_arch=$(uname -m)
-            case "$singbox_arch" in
-                x86_64) singbox_arch="amd64" ;;
-                aarch64) singbox_arch="arm64" ;;
-                armv7l) singbox_arch="armv7" ;;
-                *) print_err "不支持的架构: $singbox_arch"; return 1 ;;
-            esac
-            
-            print_info "下载 Sing-box..."
-            cd /tmp
-            local singbox_version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -oP '"tag_name": "\K[^"]+')
-            local singbox_download="https://github.com/SagerNet/sing-box/releases/download/${singbox_version}/sing-box-${singbox_version#v}-linux-${singbox_arch}.tar.gz"
-            
-            print_info "下载地址: $singbox_download"
-            if ! curl -L -o sing-box.tar.gz "$singbox_download"; then
-                # 备用下载方式
-                print_warn "GitHub 下载失败，尝试备用下载..."
-                local alt_download="https://ghproxy.com/${singbox_download}"
-                curl -L -o sing-box.tar.gz "$alt_download" || {
-                    print_err "下载失败，请手动安装 Sing-box"
-                    return 1
-                }
-            fi
-            
-            tar -xzf sing-box.tar.gz
-            sudo mv sing-box-*/sing-box /usr/local/bin/
-            sudo chmod +x /usr/local/bin/sing-box
-            rm -rf sing-box-* sing-box.tar.gz
-            print_ok "Sing-box 安装完成: $(sing-box version 2>&1 | head -1)"
-        fi
-        
-        # 创建配置文件
-        sudo mkdir -p /etc/sing-box
-        
-        if [[ "$protocol_type" == "vless" ]]; then
-            sudo tee /etc/sing-box/config.json > /dev/null <<EOF
-{
-  "log": { "level": "info" },
+  "log": {"level": "info"},
   "inbounds": [{
     "type": "vless",
     "listen": "127.0.0.1",
-    "listen_port": ${port},
-    "users": [{
-      "uuid": "${uuid}",
-      "flow": ""
-    }],
-    "transport": {
-      "type": "ws",
-      "path": "${ws_path}"
-    }
+    "listen_port": ${PORT},
+    "users": [{"uuid": "${UUID}"}],
+    "transport": {"type": "ws", "path": "${WSPATH}"}
   }],
-  "outbounds": [{
-    "type": "direct"
-  }]
+  "outbounds": [{"type": "direct"}]
 }
 EOF
-        else
-            sudo tee /etc/sing-box/config.json > /dev/null <<EOF
-{
-  "log": { "level": "info" },
-  "inbounds": [{
-    "type": "vmess",
-    "listen": "127.0.0.1",
-    "listen_port": ${port},
-    "users": [{
-      "uuid": "${uuid}",
-      "alterId": 0
-    }],
-    "transport": {
-      "type": "ws",
-      "path": "${ws_path}"
-    }
-  }],
-  "outbounds": [{
-    "type": "direct"
-  }]
-}
-EOF
-        fi
-        
-        # 创建 systemd 服务（如果不存在）
-        if [[ ! -f /etc/systemd/system/sing-box.service ]]; then
-            sudo tee /etc/systemd/system/sing-box.service > /dev/null <<'SVC_EOF'
-[Unit]
-Description=Sing-box Service
-After=network.target
 
+    if has_systemd; then
+        cat > /etc/systemd/system/sing-box.service <<SVC
+[Unit]
+Description=Sing-box
+After=network.target
 [Service]
 Type=simple
-User=root
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
-RestartSec=10
-
 [Install]
 WantedBy=multi-user.target
-SVC_EOF
-        fi
-        
-        sudo systemctl daemon-reload
-        sudo systemctl restart sing-box
-        sudo systemctl enable sing-box
-        print_ok "Sing-box 服务已启动"
+SVC
+        systemctl daemon-reload
+        systemctl restart sing-box
+        systemctl enable sing-box
+        print_ok "Sing-box 已启动（systemd）"
+    else
+        pkill sing-box 2>/dev/null; sleep 1
+        nohup /usr/local/bin/sing-box run -c /etc/sing-box/config.json > /var/log/sing-box.log 2>&1 &
+        print_ok "Sing-box 已启动（nohup）"
     fi
+}
+
+# ---------- 配置 Cloudflared 隧道 ----------
+setup_tunnel() {
+    print_info "登录 Cloudflare..."
+    cloudflared tunnel login --email "$CF_EMAIL" --api-key "$CF_API_KEY"
+
+    print_info "创建隧道..."
+    TUNNEL_NAME="auto-tunnel-$(date +%s)"
+    cloudflared tunnel create "$TUNNEL_NAME"
+    TUNNEL_ID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
+
+    print_info "配置 DNS 路由: $DOMAIN -> $TUNNEL_ID"
+    cloudflared tunnel route dns "$TUNNEL_ID" "$DOMAIN"
+
+    CFG="$CONFIG_DIR/${TUNNEL_ID}.yml"
+    cat > "$CFG" <<EOF
+tunnel: ${TUNNEL_ID}
+credentials-file: ${HOME}/.cloudflared/${TUNNEL_ID}.json
+ingress:
+  - hostname: ${DOMAIN}
+    service: http://127.0.0.1:${PORT}
+  - service: http_status:404
+EOF
+
+    # 保存信息
+    cat > "$CONFIG_DIR/tunnel_info.txt" <<EOF
+TUNNEL_ID=${TUNNEL_ID}
+TUNNEL_NAME=${TUNNEL_NAME}
+TUNNEL_DOMAIN=${DOMAIN}
+LOCAL_SERVICE=http://127.0.0.1:${PORT}
+CONFIG_FILE=${CFG}
+EOF
+
+    # 启动隧道
+    pkill cloudflared 2>/dev/null; sleep 1
+    nohup cloudflared tunnel --config "$CFG" run "$TUNNEL_ID" > /var/log/cloudflared.log 2>&1 &
+    print_ok "隧道已启动"
+}
+
+# ---------- 生成客户端连接 ----------
+generate_client_link() {
+    local preferred_ip="${1:-}"
+    [[ -z "$preferred_ip" ]] && preferred_ip="$DOMAIN"
+    local encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WSPATH}'))" 2>/dev/null || echo "$WSPATH")
+    echo -e "\n${GREEN}========== VLESS 客户端链接 ==========${NC}"
+    echo "vless://${UUID}@${preferred_ip}:${PORT}?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=${encoded_path}#Auto-${DOMAIN}"
+    echo -e "\n${YELLOW}若需优选 IP，请将地址替换为实测最快的 Cloudflare IP。${NC}"
+}
+
+# ---------- 全自动部署 ----------
+auto_deploy() {
+    # 检查必要环境变量
+    if [[ -z "$CF_EMAIL" || -z "$CF_API_KEY" ]]; then
+        print_err "请设置环境变量: CF_EMAIL 和 CF_API_KEY"
+        exit 1
+    fi
+    if [[ -z "$DOMAIN" ]]; then
+        print_err "请设置环境变量: DOMAIN (例如: myapp.example.com)"
+        exit 1
+    fi
+
+    print_banner() {
+        echo -e "${CYAN}全自动部署模式${NC}"
+    }
+    print_banner
+
+    install_deps
+    install_cloudflared
+    install_singbox
+    generate_random_config
+    start_proxy_service
+    setup_tunnel
+    generate_client_link "$PREFERRED_IP"
 
     # 保存代理信息
     cat > "$CONFIG_DIR/proxy_info.txt" <<EOF
-代理类型=${core_type}
-协议=${protocol_type}
-端口=${port}
-UUID=${uuid}
-WebSocket 路径=${ws_path}
+协议=vless
+端口=${PORT}
+UUID=${UUID}
+WebSocket 路径=${WSPATH}
 EOF
-    
-    print_ok "代理配置已保存"
-    cat "$CONFIG_DIR/proxy_info.txt"
 
-    # 自动对接现有隧道
-    if [[ -f "$CONFIG_DIR/tunnel_info.txt" ]]; then
-        source "$CONFIG_DIR/tunnel_info.txt"
-        read -rp "检测到已有 Argo 隧道，是否将隧道本地服务地址修改为 http://127.0.0.1:${port}? [Y/n]: " modify_tunnel
-        if [[ ! "$modify_tunnel" =~ ^[Nn]$ ]]; then
-            local config_file="$CONFIG_FILE"
-            if [[ -f "$config_file" ]]; then
-                sed -i "s|service: .*|service: http://127.0.0.1:${port}|" "$config_file"
-                print_ok "隧道配置已更新，本地服务指向代理端口 ${port}"
-                
-                # 重启隧道
-                pkill cloudflared 2>/dev/null || true
-                nohup cloudflared tunnel --config "$config_file" run "$TUNNEL_ID" > /dev/null 2>&1 &
-                print_ok "隧道已重启"
-            fi
-        fi
-    else
-        print_warn "未检测到 Argo 隧道，请先配置隧道 (选项 2)"
-    fi
-    
-    # 检查端口监听
-    sleep 2
-    if ss -tlnp | grep -q ":${port}"; then
-        print_ok "代理端口 ${port} 监听正常"
-    else
-        print_warn "代理端口 ${port} 未检测到监听，请检查服务状态"
-    fi
+    print_ok "全自动部署完成！"
+    echo -e "\n${GREEN}============================================${NC}"
+    echo -e "隧道域名: ${DOMAIN}"
+    echo -e "本地代理端口: ${PORT}"
+    echo -e "UUID: ${UUID}"
+    echo -e "WebSocket 路径: ${WSPATH}"
+    echo -e "\n请将上面的 VLESS 链接导入客户端使用。"
+    echo -e "如需修改配置，请运行: cf-manager (稍后安装)"
+    echo -e "${GREEN}============================================${NC}"
 }
 
-# ---------- 7. 定时任务 ----------
-setup_cron() {
-    echo -e "\n${CYAN}========== 定时自动 DNS 更新 ==========${NC}"
-    read -rp "执行间隔 (小时，默认 6): " interval
-    [[ -z "$interval" ]] && interval=6
-    local auto_script="$CONFIG_DIR/auto_optimize.sh"
-    cat > "$auto_script" <<'EOF'
-#!/bin/bash
-export PATH=/usr/local/bin:/usr/bin:/bin
-# 自动优选脚本（根据实际情况修改）
-EOF
-    chmod +x "$auto_script"
-    (crontab -l 2>/dev/null | grep -v "$auto_script"; echo "0 */${interval} * * * $auto_script") | crontab -
-    print_ok "定时任务已设置，每 ${interval} 小时执行一次"
+# ---------- 交互式菜单 ----------
+interactive_menu() {
+    print_info "交互式管理模式，请使用之前的 cf-manager 脚本。"
+    print_info "若要全自动部署，请退出并使用 --auto 参数。"
+    exit 0
 }
 
-# ---------- 8. 查看状态 ----------
-show_status() {
-    echo -e "\n${CYAN}========== 系统状态 ==========${NC}"
-    
-    echo -e "\n${YELLOW}[cloudflared]${NC}"
-    command -v cloudflared &>/dev/null && cloudflared --version || echo "未安装"
-    
-    echo -e "\n${YELLOW}[隧道配置]${NC}"
-    [[ -f "$CONFIG_DIR/tunnel_info.txt" ]] && cat "$CONFIG_DIR/tunnel_info.txt" || echo "未配置"
-    
-    echo -e "\n${YELLOW}[API 凭证]${NC}"
-    [[ -f "$CONFIG_DIR/cf_credentials.conf" ]] && echo "已配置" || echo "未配置"
-    
-    echo -e "\n${YELLOW}[代理内核]${NC}"
-    if [[ -f "$CONFIG_DIR/proxy_info.txt" ]]; then
-        cat "$CONFIG_DIR/proxy_info.txt"
-        # 检查服务状态
-        local port=$(grep "端口=" "$CONFIG_DIR/proxy_info.txt" | cut -d'=' -f2)
-        if ss -tlnp | grep -q ":${port}"; then
-            print_ok "代理服务运行中 (端口: ${port})"
-        else
-            print_warn "代理服务未运行"
-        fi
-    else
-        echo "未安装"
-    fi
-    
-    echo -e "\n${YELLOW}[隧道进程]${NC}"
-    if pgrep -f "cloudflared tunnel" > /dev/null; then
-        print_ok "隧道运行中"
-        ps aux | grep "cloudflared tunnel" | grep -v grep
-    else
-        print_warn "隧道未运行"
-    fi
-    
-    echo -e "\n${YELLOW}[定时任务]${NC}"
-    crontab -l 2>/dev/null | grep -i "auto_optimize" || echo "未设置"
-}
-
-# ---------- 9. 生成 V2Ray 客户端连接 ----------
-generate_v2ray_link() {
-    echo -e "\n${CYAN}========== 生成 V2Ray 客户端连接 ==========${NC}"
-
-    # 检查配置
-    if [[ ! -f "$CONFIG_DIR/proxy_info.txt" ]]; then
-        print_err "未找到代理内核配置，请先执行选项 6"
-        return 1
-    fi
-    if [[ ! -f "$CONFIG_DIR/tunnel_info.txt" ]]; then
-        print_err "未找到 Argo 隧道配置，请先执行选项 2"
-        return 1
-    fi
-
-    # 读取配置
-    source "$CONFIG_DIR/proxy_info.txt"
-    source "$CONFIG_DIR/tunnel_info.txt"
-    
-    local proto="${协议}"
-    local port="${端口}"
-    local uuid="${UUID}"
-    local path="${WebSocket 路径}"
-    local domain="${TUNNEL_DOMAIN}"
-    
-    echo "当前隧道域名: ${domain}"
-    read -rp "是否使用此域名作为服务器地址? [Y/n]: " use_default
-    if [[ "$use_default" =~ ^[Nn]$ ]]; then
-        read -rp "请输入自定义域名: " domain
-    fi
-    [[ -z "$domain" ]] && { print_err "域名不能为空"; return 1; }
-
-    # 获取优选 IP
-    local best_ip=""
-    read -rp "输入优选 IP (如 1.2.3.4): " best_ip
-    [[ -z "$best_ip" ]] && { print_err "优选 IP 不能为空"; return 1; }
-
-    # 备注名称
-    read -rp "输入备注名称 (可选): " remark
-    [[ -z "$remark" ]] && remark="${domain}-优选"
-
-    echo -e "\n${GREEN}========== 生成的客户端连接信息 ==========${NC}"
-    echo -e "${CYAN}服务器地址: ${best_ip}  (实际连接地址)${NC}"
-    echo -e "${CYAN}域名 (SNI/host): ${domain}${NC}"
-    echo -e "${CYAN}端口: ${port}${NC}"
-    echo -e "${CYAN}UUID: ${uuid}${NC}"
-    echo -e "${CYAN}传输协议: ws${NC}"
-    echo -e "${CYAN}路径: ${path}${NC}"
-    echo -e "${CYAN}安全: tls${NC}"
-    echo ""
-
-    # 生成链接
-    if [[ "$proto" == "vmess" ]]; then
-        local vmess_json='{"v":"2","ps":"'${remark}'","add":"'${best_ip}'","port":"'${port}'","id":"'${uuid}'","aid":"0","net":"ws","type":"none","host":"'${domain}'","path":"'${path}'","tls":"tls"}'
-        local vmess_base64=$(echo -n "$vmess_json" | base64 -w 0)
-        echo -e "${GREEN}VMess 链接:${NC}"
-        echo "vmess://${vmess_base64}"
-    elif [[ "$proto" == "vless" ]]; then
-        local encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${path}'))" 2>/dev/null || echo "${path}")
-        local vless_url="vless://${uuid}@${best_ip}:${port}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encoded_path}#${remark}"
-        echo -e "${GREEN}VLESS 链接:${NC}"
-        echo "${vless_url}"
-    else
-        # 兼容旧格式（协议字段可能包含额外信息）
-        if [[ "$proto" == *"vless"* ]] || [[ "$proto" == *"VLESS"* ]]; then
-            local encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${path}'))" 2>/dev/null || echo "${path}")
-            local vless_url="vless://${uuid}@${best_ip}:${port}?encryption=none&security=tls&sni=${domain}&type=ws&host=${domain}&path=${encoded_path}#${remark}"
-            echo -e "${GREEN}VLESS 链接:${NC}"
-            echo "${vless_url}"
-        elif [[ "$proto" == *"vmess"* ]] || [[ "$proto" == *"VMess"* ]]; then
-            local vmess_json='{"v":"2","ps":"'${remark}'","add":"'${best_ip}'","port":"'${port}'","id":"'${uuid}'","aid":"0","net":"ws","type":"none","host":"'${domain}'","path":"'${path}'","tls":"tls"}'
-            local vmess_base64=$(echo -n "$vmess_json" | base64 -w 0)
-            echo -e "${GREEN}VMess 链接:${NC}"
-            echo "vmess://${vmess_base64}"
-        else
-            print_err "不支持的协议: $proto"
-            return 1
-        fi
-    fi
-
-    echo ""
-    echo -e "${YELLOW}======================================${NC}"
-    echo -e "手动配置参数:"
-    echo -e "  地址: ${best_ip}"
-    echo -e "  端口: ${port}"
-    echo -e "  UUID: ${uuid}"
-    echo -e "  传输: ws"
-    echo -e "  路径: ${path}"
-    echo -e "  TLS: 开启"
-    echo -e "  SNI: ${domain}"
-    echo -e "${YELLOW}======================================${NC}"
-
-    # 询问是否写入 hosts
-    read -rp "是否将 ${domain} 在本地 hosts 中指向 ${best_ip}? [y/N]: " write_hosts
-    if [[ "$write_hosts" =~ ^[Yy]$ ]]; then
-        write_hosts_file "$best_ip" "$domain"
-    fi
-    
-    # 询问是否更新 Cloudflare DNS
-    read -rp "是否更新 Cloudflare DNS A 记录? [y/N]: " update_dns
-    if [[ "$update_dns" =~ ^[Yy]$ ]]; then
-        if [[ -f "$CONFIG_DIR/cf_credentials.conf" ]]; then
-            source "$CONFIG_DIR/cf_credentials.conf"
-            if [[ -n "$ZONE_ID" && -n "$RECORD_NAME" ]]; then
-                local auth_header=""
-                if [[ -n "$API_TOKEN" ]]; then
-                    auth_header="Authorization: Bearer ${API_TOKEN}"
-                else
-                    auth_header="X-Auth-Key: ${API_KEY}"
-                fi
-                
-                local list_url="${CF_API_URL}/zones/${ZONE_ID}/dns_records?type=A&name=${RECORD_NAME}"
-                local list_response=$(curl_with_retry "GET" "$list_url" \
-                    -H "Content-Type: application/json" \
-                    -H "$auth_header" \
-                    ${EMAIL:+-H "X-Auth-Email: ${EMAIL}"})
-                
-                if [[ -n "$list_response" ]]; then
-                    local record_id=$(echo "$list_response" | grep -oP '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
-                    local payload="{\"type\":\"A\",\"name\":\"${RECORD_NAME}\",\"content\":\"${best_ip}\",\"ttl\":120,\"proxied\":false}"
-                    
-                    if [[ -n "$record_id" ]]; then
-                        curl_with_retry "PUT" "${CF_API_URL}/zones/${ZONE_ID}/dns_records/${record_id}" \
-                            -H "Content-Type: application/json" \
-                            -H "$auth_header" \
-                            ${EMAIL:+-H "X-Auth-Email: ${EMAIL}"} \
-                            -d "$payload" > /dev/null
-                    else
-                        curl_with_retry "POST" "${CF_API_URL}/zones/${ZONE_ID}/dns_records" \
-                            -H "Content-Type: application/json" \
-                            -H "$auth_header" \
-                            ${EMAIL:+-H "X-Auth-Email: ${EMAIL}"} \
-                            -d "$payload" > /dev/null
-                    fi
-                    print_ok "DNS 记录已更新"
-                fi
-            fi
-        else
-            print_warn "未找到 API 凭证，请先执行选项 3"
-        fi
-    fi
-}
-
-# ---------- 主菜单 ----------
-show_menu() {
-    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}  主菜单${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  ${GREEN}1${NC}. 安装/更新 cloudflared"
-    echo -e "  ${GREEN}2${NC}. 配置 Argo 隧道"
-    echo -e "  ${GREEN}3${NC}. Cloudflare DNS 更新 (A 记录)"
-    echo -e "  ${GREEN}4${NC}. 写入 /etc/hosts"
-    echo -e "  ${GREEN}5${NC}. Argo 隧道 + CNAME 优选路由"
-    echo -e "  ${GREEN}6${NC}. 安装代理内核 (Xray/Sing-box) 并自动对接隧道"
-    echo -e "  ${GREEN}7${NC}. 设置定时自动 DNS 更新"
-    echo -e "  ${GREEN}8${NC}. 查看系统状态"
-    echo -e "  ${GREEN}9${NC}. 生成 V2Ray 客户端连接 (基于优选 IP)"
-    echo -e "  ${GREEN}0${NC}. 退出"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
-
-main() {
-    ensure_dirs
-
-    print_banner
-    while true; do
-        show_menu
-        read -rp "请选择 [0-9]: " choice
-        case "$choice" in
-            1) install_cloudflared ;;
-            2) setup_argo_tunnel ;;
-            3) update_cloudflare_dns ;;
-            4) write_hosts_file ;;
-            5) setup_argo_cname ;;
-            6) install_proxy_core ;;
-            7) setup_cron ;;
-            8) show_status ;;
-            9) generate_v2ray_link ;;
-            0) print_ok "再见!"; exit 0 ;;
-            *) print_err "无效选择" ;;
-        esac
-        echo ""
-        read -rp "按 Enter 返回菜单..."
-    done
-}
-
-main "$@"
+# ---------- 主入口 ----------
+case "${1:-}" in
+    --auto|auto)
+        auto_deploy
+        ;;
+    *)
+        interactive_menu
+        ;;
+esac
